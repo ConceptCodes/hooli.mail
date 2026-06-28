@@ -99,10 +99,12 @@ func main() {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
-	smtpReceiving := smtp.NewServer(store, ":"+*smtpPort, nil, false)
-	smtpSubmission := smtp.NewServer(store, ":"+*submissionPort, tlsConfig, true)
-	imapStartTLS := imap.NewServer(store, ":"+*imapPort, tlsConfig)
-	imapTLS := imap.NewServer(store, ":"+*imapsPort, tlsConfig)
+	authn := auth.NewAuthenticator(store)
+
+	smtpReceiving := smtp.NewServer(store, authn, ":"+*smtpPort, nil, false)
+	smtpSubmission := smtp.NewServer(store, authn, ":"+*submissionPort, tlsConfig, true)
+	imapStartTLS := imap.NewServer(store, authn, ":"+*imapPort, tlsConfig)
+	imapTLS := imap.NewServer(store, authn, ":"+*imapsPort, tlsConfig)
 
 	start := []struct {
 		Name string

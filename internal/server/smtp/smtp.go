@@ -1,3 +1,7 @@
+// Package smtp is the SMTP protocol adapter: it turns SMTP sessions into
+// delivery calls against a mailstore.Store and authenticates them via an
+// auth.Authenticator. It owns only the protocol-to-domain translation — storage
+// and credentials live behind their seams.
 package smtp
 
 import (
@@ -10,18 +14,21 @@ import (
 	"strings"
 
 	"hooli.mail/server/internal/auth"
-	"hooli.mail/server/internal/storage/postgres"
+	"hooli.mail/server/internal/mailstore"
+	"hooli.mail/server/internal/message"
+	"hooli.mail/server/internal/models"
 
 	gosmtp "github.com/emersion/go-smtp"
 )
 
 type Backend struct {
-	store       *postgres.Store
+	store       mailstore.Store
+	authn       *auth.Authenticator
 	requireAuth bool
 }
 
-func NewBackend(store *postgres.Store, requireAuth bool) *Backend {
-	return &Backend{store: store, requireAuth: requireAuth}
+func NewBackend(store mailstore.Store, authn *auth.Authenticator, requireAuth bool) *Backend {
+	return &Backend{store: store, authn: authn, requireAuth: requireAuth}
 }
 
 func (b *Backend) NewSession(_ *gosmtp.Conn) (gosmtp.Session, error) {
@@ -32,32 +39,19 @@ func (b *Backend) NewSession(_ *gosmtp.Conn) (gosmtp.Session, error) {
 }
 
 type Session struct {
-	backend  *Backend
-	ctx      context.Context
-	from     string
-	to       []string
-	user     *postgresUser
-}
-
-type postgresUser struct {
-	id    int64
-	email string
+	backend *Backend
+	ctx     context.Context
+	from    string
+	to      []string
+	user    *models.User
 }
 
 func (s *Session) AuthPlain(username, password string) error {
-	u, err := s.backend.store.GetUserByEmail(s.ctx, username)
+	u, err := s.backend.authn.Verify(s.ctx, username, password)
 	if err != nil {
-		return fmt.Errorf("get user: %w", err)
+		return err
 	}
-	if u == nil {
-		return auth.ErrInvalidCredentials
-	}
-
-	if err := auth.VerifyPassword(password, u.PasswordHash); err != nil {
-		return auth.ErrInvalidCredentials
-	}
-
-	s.user = &postgresUser{id: u.ID, email: u.Email}
+	s.user = u
 	return nil
 }
 
@@ -69,8 +63,8 @@ func (s *Session) Mail(from string, opts *gosmtp.MailOptions) error {
 			Message:      "Authentication required",
 		}
 	}
-	if s.user != nil && !strings.Contains(from, s.user.email) {
-		from = s.user.email
+	if s.user != nil && !strings.Contains(from, s.user.Email) {
+		from = s.user.Email
 	}
 	s.from = from
 	s.to = nil
@@ -90,19 +84,10 @@ func (s *Session) Data(r io.Reader) error {
 		return fmt.Errorf("read data: %w", err)
 	}
 
-	body := string(raw)
-
-	subject := ""
-	lines := strings.Split(body, "\n")
-	for _, line := range lines {
-		if strings.HasPrefix(strings.ToLower(line), "subject:") {
-			subject = strings.TrimSpace(line[8:])
-			break
-		}
-	}
+	parsed := message.Parse(raw)
 
 	for _, recipient := range s.to {
-		if err := s.deliver(recipient, subject, body); err != nil {
+		if err := s.deliver(recipient, parsed); err != nil {
 			log.Printf("deliver to %s: %v", recipient, err)
 		}
 	}
@@ -110,7 +95,7 @@ func (s *Session) Data(r io.Reader) error {
 	return nil
 }
 
-func (s *Session) deliver(recipientEmail, subject, body string) error {
+func (s *Session) deliver(recipientEmail string, parsed message.Parsed) error {
 	u, err := s.backend.store.GetUserByEmail(s.ctx, recipientEmail)
 	if err != nil {
 		return fmt.Errorf("get recipient: %w", err)
@@ -132,7 +117,12 @@ func (s *Session) deliver(recipientEmail, subject, body string) error {
 		to = []string{recipientEmail}
 	}
 
-	_, err = s.backend.store.CreateEmail(s.ctx, inbox.ID, s.from, to, subject, body)
+	_, err = s.backend.store.Append(s.ctx, inbox.ID, mailstore.Message{
+		From:    s.from,
+		To:      to,
+		Subject: parsed.Subject,
+		Body:    parsed.Body,
+	})
 	return err
 }
 
@@ -149,8 +139,8 @@ type Server struct {
 	srv *gosmtp.Server
 }
 
-func NewServer(store *postgres.Store, addr string, tlsCfg *tls.Config, requireAuth bool) *Server {
-	backend := NewBackend(store, requireAuth)
+func NewServer(store mailstore.Store, authn *auth.Authenticator, addr string, tlsCfg *tls.Config, requireAuth bool) *Server {
+	backend := NewBackend(store, authn, requireAuth)
 	srv := gosmtp.NewServer(backend)
 	srv.Addr = addr
 	srv.Domain = "hooli.mail"

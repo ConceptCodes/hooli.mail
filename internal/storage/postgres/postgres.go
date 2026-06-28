@@ -1,10 +1,14 @@
+// Package postgres is the production mailstore.Store adapter, backed by
+// PostgreSQL via pgx. The protocol servers never import this package directly
+// for behaviour — they depend on mailstore.Store, and cmd/server wires this
+// concrete adapter in.
 package postgres
 
 import (
 	"context"
 	"fmt"
-	"time"
 
+	"hooli.mail/server/internal/mailstore"
 	"hooli.mail/server/internal/models"
 
 	"github.com/jackc/pgx/v5"
@@ -14,6 +18,8 @@ import (
 type Store struct {
 	pool *pgxpool.Pool
 }
+
+var _ mailstore.Store = (*Store)(nil)
 
 func New(ctx context.Context, connString string) (*Store, error) {
 	cfg, err := pgxpool.ParseConfig(connString)
@@ -77,21 +83,6 @@ func (s *Store) GetUserByEmail(ctx context.Context, email string) (*models.User,
 	return &u, nil
 }
 
-func (s *Store) GetUserByID(ctx context.Context, id int64) (*models.User, error) {
-	var u models.User
-	err := s.pool.QueryRow(ctx,
-		`SELECT id, email, password_hash, created_at FROM users WHERE id = $1`,
-		id,
-	).Scan(&u.ID, &u.Email, &u.PasswordHash, &u.CreatedAt)
-	if err != nil {
-		if err == pgx.ErrNoRows {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("get user: %w", err)
-	}
-	return &u, nil
-}
-
 func (s *Store) CreateMailbox(ctx context.Context, userID int64, name string) (*models.Mailbox, error) {
 	var mb models.Mailbox
 	err := s.pool.QueryRow(ctx,
@@ -141,21 +132,6 @@ func (s *Store) GetMailboxByName(ctx context.Context, userID int64, name string)
 	return &mb, nil
 }
 
-func (s *Store) GetMailboxByID(ctx context.Context, id int64) (*models.Mailbox, error) {
-	var mb models.Mailbox
-	err := s.pool.QueryRow(ctx,
-		`SELECT id, user_id, name, created_at FROM mailboxes WHERE id = $1`,
-		id,
-	).Scan(&mb.ID, &mb.UserID, &mb.Name, &mb.CreatedAt)
-	if err != nil {
-		if err == pgx.ErrNoRows {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("get mailbox: %w", err)
-	}
-	return &mb, nil
-}
-
 func (s *Store) DeleteMailbox(ctx context.Context, id int64) error {
 	_, err := s.pool.Exec(ctx, `DELETE FROM mailboxes WHERE id = $1`, id)
 	return fmt.Errorf("delete mailbox: %w", err)
@@ -166,52 +142,86 @@ func (s *Store) RenameMailbox(ctx context.Context, id int64, newName string) err
 	return fmt.Errorf("rename mailbox: %w", err)
 }
 
-func (s *Store) CreateEmail(ctx context.Context, mailboxID int64, from string, to []string, subject, body string) (*models.Email, error) {
-	flags := []string{models.FlagRecent}
-	size := len(body)
+// Status computes all IMAP mailbox counters in one place. \Recent and unseen
+// are derived from the actual flags columns rather than reported as "every
+// message is recent and unseen", which was the previous behaviour.
+func (s *Store) Status(ctx context.Context, mailboxID int64) (mailstore.Status, error) {
+	var st mailstore.Status
+	st.UIDValidity = 1
+
+	queries := []struct {
+		sql   string
+		flag  string
+		dst   *uint32
+	}{
+		{`SELECT COUNT(*) FROM emails WHERE mailbox_id = $1`, "", &st.Messages},
+		{`SELECT COUNT(*) FROM emails WHERE mailbox_id = $1 AND $2 = ANY(flags)`, models.FlagRecent, &st.Recent},
+		{`SELECT COUNT(*) FROM emails WHERE mailbox_id = $1 AND NOT ($2 = ANY(flags))`, models.FlagSeen, &st.Unseen},
+	}
+
+	for _, q := range queries {
+		var n int
+		var err error
+		if q.flag == "" {
+			err = s.pool.QueryRow(ctx, q.sql, mailboxID).Scan(&n)
+		} else {
+			err = s.pool.QueryRow(ctx, q.sql, mailboxID, q.flag).Scan(&n)
+		}
+		if err != nil {
+			return mailstore.Status{}, fmt.Errorf("status count: %w", err)
+		}
+		*q.dst = uint32(n)
+	}
+
+	var lastID int64
+	if err := s.pool.QueryRow(ctx,
+		`SELECT COALESCE(MAX(id), 0) FROM emails WHERE mailbox_id = $1`,
+		mailboxID,
+	).Scan(&lastID); err != nil {
+		return mailstore.Status{}, fmt.Errorf("status uidnext: %w", err)
+	}
+	st.UIDNext = uint32(lastID) + 1
+
+	return st, nil
+}
+
+// Append stores a Message. Empty Flags default to [\Recent], matching the
+// delivery path; IMAP APPEND passes through the caller's flags.
+func (s *Store) Append(ctx context.Context, mailboxID int64, msg mailstore.Message) (*models.Email, error) {
+	flags := msg.Flags
+	if len(flags) == 0 {
+		flags = []string{models.FlagRecent}
+	}
+	size := len(msg.Body)
 
 	var e models.Email
 	err := s.pool.QueryRow(ctx,
 		`INSERT INTO emails (mailbox_id, from_address, to_addresses, subject, body, flags, size)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7)
 		 RETURNING id, mailbox_id, from_address, to_addresses, subject, body, flags, date, size`,
-		mailboxID, from, to, subject, body, flags, size,
+		mailboxID, msg.From, msg.To, msg.Subject, msg.Body, flags, size,
 	).Scan(&e.ID, &e.MailboxID, &e.From, &e.To, &e.Subject, &e.Body, &e.Flags, &e.Date, &e.Size)
 	if err != nil {
-		return nil, fmt.Errorf("create email: %w", err)
+		return nil, fmt.Errorf("append email: %w", err)
 	}
 	return &e, nil
 }
 
-func (s *Store) GetEmail(ctx context.Context, id int64) (*models.Email, error) {
-	var e models.Email
-	err := s.pool.QueryRow(ctx,
-		`SELECT id, mailbox_id, from_address, to_addresses, subject, body, flags, date, size
-		 FROM emails WHERE id = $1`,
-		id,
-	).Scan(&e.ID, &e.MailboxID, &e.From, &e.To, &e.Subject, &e.Body, &e.Flags, &e.Date, &e.Size)
-	if err != nil {
-		if err == pgx.ErrNoRows {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("get email: %w", err)
-	}
-	return &e, nil
-}
-
-func (s *Store) GetEmails(ctx context.Context, mailboxID int64) ([]models.Email, error) {
+// List returns every message in a Mailbox, newest first, with sequence numbers
+// assigned in that order (1 = newest).
+func (s *Store) List(ctx context.Context, mailboxID int64) ([]models.Email, error) {
 	rows, err := s.pool.Query(ctx,
 		`SELECT id, mailbox_id, from_address, to_addresses, subject, body, flags, date, size
 		 FROM emails WHERE mailbox_id = $1 ORDER BY date DESC`,
 		mailboxID,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("get emails: %w", err)
+		return nil, fmt.Errorf("list emails: %w", err)
 	}
 	defer rows.Close()
 
 	var emails []models.Email
-	seqNum := uint32(len(emails))
+	seqNum := uint32(0)
 	for rows.Next() {
 		seqNum++
 		var e models.Email
@@ -224,90 +234,80 @@ func (s *Store) GetEmails(ctx context.Context, mailboxID int64) ([]models.Email,
 	return emails, nil
 }
 
-func (s *Store) GetEmailCount(ctx context.Context, mailboxID int64) (int, error) {
-	var count int
-	err := s.pool.QueryRow(ctx,
-		`SELECT COUNT(*) FROM emails WHERE mailbox_id = $1`,
-		mailboxID,
-	).Scan(&count)
-	if err != nil {
-		return 0, fmt.Errorf("get email count: %w", err)
-	}
-	return count, nil
-}
-
-func (s *Store) UpdateFlags(ctx context.Context, emailID int64, flags []string) error {
+func (s *Store) SetFlags(ctx context.Context, emailID int64, flags []string) error {
 	_, err := s.pool.Exec(ctx,
 		`UPDATE emails SET flags = $1 WHERE id = $2`,
 		flags, emailID,
 	)
-	return fmt.Errorf("update flags: %w", err)
+	return fmt.Errorf("set flags: %w", err)
 }
 
-func (s *Store) DeleteEmail(ctx context.Context, emailID int64) error {
+func (s *Store) DeleteMessage(ctx context.Context, emailID int64) error {
 	_, err := s.pool.Exec(ctx, `DELETE FROM emails WHERE id = $1`, emailID)
 	return fmt.Errorf("delete email: %w", err)
 }
 
-func (s *Store) DeleteEmails(ctx context.Context, mailboxID int64, emailIDs []int64) error {
-	_, err := s.pool.Exec(ctx,
-		`DELETE FROM emails WHERE mailbox_id = $1 AND id = ANY($2)`,
-		mailboxID, emailIDs,
-	)
-	return fmt.Errorf("delete emails: %w", err)
-}
-
-func (s *Store) MoveEmail(ctx context.Context, emailID int64, destMailboxID int64) error {
-	_, err := s.pool.Exec(ctx,
-		`UPDATE emails SET mailbox_id = $1 WHERE id = $2`,
-		destMailboxID, emailID,
-	)
-	return fmt.Errorf("move email: %w", err)
-}
-
-func (s *Store) GetLastUID(ctx context.Context, mailboxID int64) (uint32, error) {
-	var lastID int64
-	err := s.pool.QueryRow(ctx,
-		`SELECT COALESCE(MAX(id), 0) FROM emails WHERE mailbox_id = $1`,
-		mailboxID,
-	).Scan(&lastID)
-	if err != nil {
-		return 0, fmt.Errorf("get last uid: %w", err)
-	}
-	return uint32(lastID), nil
-}
-
-func (s *Store) GetEmailsByUIDs(ctx context.Context, mailboxID int64, uids []uint32) ([]models.Email, error) {
-	ids := make([]int64, len(uids))
-	for i, uid := range uids {
-		ids[i] = int64(uid)
-	}
-
-	rows, err := s.pool.Query(ctx,
-		`SELECT id, mailbox_id, from_address, to_addresses, subject, body, flags, date, size
-		 FROM emails WHERE mailbox_id = $1 AND id = ANY($2) ORDER BY id`,
-		mailboxID, ids,
+// Expunge removes every message in the Mailbox carrying \Deleted in a single
+// statement, returning the number removed.
+func (s *Store) Expunge(ctx context.Context, mailboxID int64) (int, error) {
+	tag, err := s.pool.Exec(ctx,
+		`DELETE FROM emails WHERE mailbox_id = $1 AND $2 = ANY(flags)`,
+		mailboxID, models.FlagDeleted,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("get emails by uids: %w", err)
+		return 0, fmt.Errorf("expunge: %w", err)
+	}
+	return int(tag.RowsAffected()), nil
+}
+
+// Copy duplicates the selected messages into the destination Mailbox inside one
+// transaction, preserving flags (which the previous loop-based Append dropped).
+func (s *Store) Copy(ctx context.Context, srcMailboxID int64, ids []int64, destMailboxID int64) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("copy begin: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	rows, err := tx.Query(ctx,
+		`SELECT from_address, to_addresses, subject, body, flags
+		 FROM emails WHERE mailbox_id = $1 AND id = ANY($2)`,
+		srcMailboxID, ids,
+	)
+	if err != nil {
+		return fmt.Errorf("copy select: %w", err)
 	}
 	defer rows.Close()
 
-	var emails []models.Email
-	for rows.Next() {
-		var e models.Email
-		if err := rows.Scan(&e.ID, &e.MailboxID, &e.From, &e.To, &e.Subject, &e.Body, &e.Flags, &e.Date, &e.Size); err != nil {
-			return nil, fmt.Errorf("scan email: %w", err)
-		}
-		emails = append(emails, e)
+	type src struct {
+		from, subject, body string
+		to, flags            []string
 	}
-	return emails, nil
-}
+	var msgs []src
+	for rows.Next() {
+		var m src
+		if err := rows.Scan(&m.from, &m.to, &m.subject, &m.body, &m.flags); err != nil {
+			return fmt.Errorf("copy scan: %w", err)
+		}
+		msgs = append(msgs, m)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("copy rows: %w", err)
+	}
 
-func (s *Store) CreateSession(_ context.Context, _ int64) (string, time.Time, error) {
-	return "", time.Time{}, fmt.Errorf("not implemented")
-}
+	for _, m := range msgs {
+		size := len(m.body)
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO emails (mailbox_id, from_address, to_addresses, subject, body, flags, size)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+			destMailboxID, m.from, m.to, m.subject, m.body, m.flags, size,
+		); err != nil {
+			return fmt.Errorf("copy insert: %w", err)
+		}
+	}
 
-func (s *Store) ValidateSession(_ context.Context, _ string) (*models.User, error) {
-	return nil, fmt.Errorf("not implemented")
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("copy commit: %w", err)
+	}
+	return nil
 }

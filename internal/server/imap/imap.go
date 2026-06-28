@@ -1,3 +1,8 @@
+// Package imap is the IMAP protocol adapter. It translates go-imap backend
+// calls into operations on a mailstore.Store, authenticating via an
+// auth.Authenticator. Mailbox semantics that were previously reassembled here
+// by looping over CRUD reads/writes — status counts, expunge, copy — now live
+// behind single Store calls.
 package imap
 
 import (
@@ -12,8 +17,9 @@ import (
 	"time"
 
 	"hooli.mail/server/internal/auth"
+	"hooli.mail/server/internal/mailstore"
+	"hooli.mail/server/internal/message"
 	"hooli.mail/server/internal/models"
-	"hooli.mail/server/internal/storage/postgres"
 
 	imap "github.com/emersion/go-imap"
 	imapbackend "github.com/emersion/go-imap/backend"
@@ -21,25 +27,19 @@ import (
 )
 
 type IMAPBackend struct {
-	store *postgres.Store
+	store mailstore.Store
+	authn *auth.Authenticator
 }
 
-func NewBackend(store *postgres.Store) *IMAPBackend {
-	return &IMAPBackend{store: store}
+func NewBackend(store mailstore.Store, authn *auth.Authenticator) *IMAPBackend {
+	return &IMAPBackend{store: store, authn: authn}
 }
 
 func (b *IMAPBackend) Login(connInfo *imap.ConnInfo, username, password string) (imapbackend.User, error) {
 	ctx := context.Background()
 
-	u, err := b.store.GetUserByEmail(ctx, username)
+	u, err := b.authn.Verify(ctx, username, password)
 	if err != nil {
-		return nil, fmt.Errorf("get user: %w", err)
-	}
-	if u == nil {
-		return nil, imapbackend.ErrInvalidCredentials
-	}
-
-	if err := auth.VerifyPassword(password, u.PasswordHash); err != nil {
 		return nil, imapbackend.ErrInvalidCredentials
 	}
 
@@ -67,7 +67,8 @@ func (u *IMAPUser) ListMailboxes(subscribed bool) ([]imapbackend.Mailbox, error)
 	}
 
 	var boxes []imapbackend.Mailbox
-	for _, mb := range mailboxes {
+	for i := range mailboxes {
+		mb := mailboxes[i]
 		boxes = append(boxes, &IMAPMailbox{
 			backend: u.backend,
 			mailbox: &mb,
@@ -140,29 +141,19 @@ func (m *IMAPMailbox) Info() (*imap.MailboxInfo, error) {
 }
 
 func (m *IMAPMailbox) Status(items []imap.StatusItem) (*imap.MailboxStatus, error) {
-	count, err := m.backend.store.GetEmailCount(m.user.ctx, m.mailbox.ID)
+	st, err := m.backend.store.Status(m.user.ctx, m.mailbox.ID)
 	if err != nil {
 		return nil, err
-	}
-
-	lastUID, err := m.backend.store.GetLastUID(m.user.ctx, m.mailbox.ID)
-	if err != nil {
-		return nil, err
-	}
-
-	recent := 0
-	if count > 0 {
-		recent = count
 	}
 
 	return &imap.MailboxStatus{
-		Name:          m.mailbox.Name,
-		Messages:      uint32(count),
-		Recent:        uint32(recent),
-		Unseen:        uint32(count),
-		UidNext:       lastUID + 1,
-		UidValidity:   1,
-		Flags:         []string{imap.SeenFlag, imap.AnsweredFlag, imap.FlaggedFlag, imap.DeletedFlag, imap.DraftFlag, imap.RecentFlag},
+		Name:           m.mailbox.Name,
+		Messages:       st.Messages,
+		Recent:         st.Recent,
+		Unseen:         st.Unseen,
+		UidNext:        st.UIDNext,
+		UidValidity:    st.UIDValidity,
+		Flags:          []string{imap.SeenFlag, imap.AnsweredFlag, imap.FlaggedFlag, imap.DeletedFlag, imap.DraftFlag, imap.RecentFlag},
 		PermanentFlags: []string{imap.SeenFlag, imap.AnsweredFlag, imap.FlaggedFlag, imap.DeletedFlag, imap.DraftFlag},
 	}, nil
 }
@@ -178,25 +169,24 @@ func (m *IMAPMailbox) Check() error {
 func (m *IMAPMailbox) ListMessages(uid bool, seqSet *imap.SeqSet, items []imap.FetchItem, ch chan<- *imap.Message) error {
 	defer close(ch)
 
-	emails, err := m.backend.store.GetEmails(m.user.ctx, m.mailbox.ID)
+	emails, err := m.backend.store.List(m.user.ctx, m.mailbox.ID)
 	if err != nil {
 		return err
 	}
 
 	for _, email := range emails {
-		seqNum := email.SeqNum
 		var id uint32
 		if uid {
 			id = uint32(email.ID)
 		} else {
-			id = seqNum
+			id = email.SeqNum
 		}
 
 		if !seqSet.Contains(id) {
 			continue
 		}
 
-		msg := imap.NewMessage(seqNum, items)
+		msg := imap.NewMessage(email.SeqNum, items)
 		msg.Uid = uint32(email.ID)
 		msg.Flags = email.Flags
 		msg.Size = uint32(email.Size)
@@ -230,7 +220,7 @@ func (m *IMAPMailbox) ListMessages(uid bool, seqSet *imap.SeqSet, items []imap.F
 }
 
 func (m *IMAPMailbox) SearchMessages(uid bool, criteria *imap.SearchCriteria) ([]uint32, error) {
-	emails, err := m.backend.store.GetEmails(m.user.ctx, m.mailbox.ID)
+	emails, err := m.backend.store.List(m.user.ctx, m.mailbox.ID)
 	if err != nil {
 		return nil, err
 	}
@@ -270,39 +260,20 @@ func (m *IMAPMailbox) CreateMessage(flags []string, date time.Time, body imap.Li
 		return fmt.Errorf("read body: %w", err)
 	}
 
-	content := string(raw)
-	subject := ""
-	from := ""
-	lines := strings.Split(content, "\n")
-	for _, line := range lines {
-		lower := strings.ToLower(line)
-		if strings.HasPrefix(lower, "subject:") {
-			subject = strings.TrimSpace(line[8:])
-		} else if strings.HasPrefix(lower, "from:") {
-			from = strings.TrimSpace(line[5:])
-		}
-		if subject != "" && from != "" {
-			break
-		}
-	}
+	parsed := message.Parse(raw)
 
-	var to []string
-	line1 := strings.SplitN(content, "\n", 2)[0]
-	if strings.HasPrefix(strings.ToLower(line1), "to:") {
-		to = append(to, strings.TrimSpace(line1[3:]))
-	}
-
-	allFlags := flags
-	if allFlags == nil {
-		allFlags = []string{models.FlagRecent}
-	}
-
-	_, err = m.backend.store.CreateEmail(m.user.ctx, m.mailbox.ID, from, to, subject, content)
+	_, err = m.backend.store.Append(m.user.ctx, m.mailbox.ID, mailstore.Message{
+		From:    parsed.From,
+		To:      parsed.To,
+		Subject: parsed.Subject,
+		Body:    parsed.Body,
+		Flags:   flags,
+	})
 	return err
 }
 
 func (m *IMAPMailbox) UpdateMessagesFlags(uid bool, seqSet *imap.SeqSet, operation imap.FlagsOp, flags []string) error {
-	emails, err := m.backend.store.GetEmails(m.user.ctx, m.mailbox.ID)
+	emails, err := m.backend.store.List(m.user.ctx, m.mailbox.ID)
 	if err != nil {
 		return err
 	}
@@ -320,7 +291,7 @@ func (m *IMAPMailbox) UpdateMessagesFlags(uid bool, seqSet *imap.SeqSet, operati
 		}
 
 		newFlags := applyFlagsOp(email.Flags, operation, flags)
-		if err := m.backend.store.UpdateFlags(m.user.ctx, email.ID, newFlags); err != nil {
+		if err := m.backend.store.SetFlags(m.user.ctx, email.ID, newFlags); err != nil {
 			return err
 		}
 	}
@@ -336,11 +307,12 @@ func (m *IMAPMailbox) CopyMessages(uid bool, seqSet *imap.SeqSet, destName strin
 		return fmt.Errorf("destination mailbox not found: %s", destName)
 	}
 
-	emails, err := m.backend.store.GetEmails(m.user.ctx, m.mailbox.ID)
+	emails, err := m.backend.store.List(m.user.ctx, m.mailbox.ID)
 	if err != nil {
 		return err
 	}
 
+	var ids []int64
 	for _, email := range emails {
 		var id uint32
 		if uid {
@@ -348,36 +320,17 @@ func (m *IMAPMailbox) CopyMessages(uid bool, seqSet *imap.SeqSet, destName strin
 		} else {
 			id = email.SeqNum
 		}
-
-		if !seqSet.Contains(id) {
-			continue
-		}
-
-		_, err := m.backend.store.CreateEmail(m.user.ctx, dest.ID, email.From, email.To, email.Subject, email.Body)
-		if err != nil {
-			return err
+		if seqSet.Contains(id) {
+			ids = append(ids, email.ID)
 		}
 	}
-	return nil
+
+	return m.backend.store.Copy(m.user.ctx, m.mailbox.ID, ids, dest.ID)
 }
 
 func (m *IMAPMailbox) Expunge() error {
-	emails, err := m.backend.store.GetEmails(m.user.ctx, m.mailbox.ID)
-	if err != nil {
-		return err
-	}
-
-	for _, email := range emails {
-		for _, flag := range email.Flags {
-			if strings.EqualFold(flag, string(imap.DeletedFlag)) {
-				if err := m.backend.store.DeleteEmail(m.user.ctx, email.ID); err != nil {
-					return err
-				}
-				break
-			}
-		}
-	}
-	return nil
+	_, err := m.backend.store.Expunge(m.user.ctx, m.mailbox.ID)
+	return err
 }
 
 func (m *IMAPMailbox) buildEnvelope(email models.Email) *imap.Envelope {
@@ -406,7 +359,7 @@ func (m *IMAPMailbox) buildEnvelope(email models.Email) *imap.Envelope {
 	return &imap.Envelope{
 		Date:    email.Date,
 		Subject: email.Subject,
-		From:    []*imap.Address{{
+		From: []*imap.Address{{
 			PersonalName: mailboxName,
 			MailboxName:  mailboxName,
 			HostName:     hostName,
@@ -415,6 +368,9 @@ func (m *IMAPMailbox) buildEnvelope(email models.Email) *imap.Envelope {
 	}
 }
 
+// applyFlagsOp encodes IMAP STORE flag operations (set/add/remove) against a
+// flag set. It is IMAP semantics, not storage, so it stays in the protocol
+// adapter rather than the Store.
 func applyFlagsOp(current []string, op imap.FlagsOp, flags []string) []string {
 	flagSet := make(map[string]bool)
 	for _, f := range current {
@@ -444,8 +400,8 @@ type Server struct {
 	srv *imapserver.Server
 }
 
-func NewServer(store *postgres.Store, addr string, tlsCfg *tls.Config) *Server {
-	backend := NewBackend(store)
+func NewServer(store mailstore.Store, authn *auth.Authenticator, addr string, tlsCfg *tls.Config) *Server {
+	backend := NewBackend(store, authn)
 	srv := imapserver.New(backend)
 	srv.Addr = addr
 	srv.AllowInsecureAuth = true
