@@ -10,11 +10,13 @@ all: server tui
 # Build the mail server
 server:
     @echo "Building server for {{goos}}/{{goarch}}..."
+    @mkdir -p bin
     CGO_ENABLED=0 go build -ldflags='-s -w -X main.version={{version}} -X main.commit={{commit}}' -o bin/server ./cmd/server
 
 # Build the TUI
 tui:
     @echo "Building TUI for {{goos}}/{{goarch}}..."
+    @mkdir -p bin
     CGO_ENABLED=0 go build -ldflags='-s -w -X main.version={{version}} -X main.commit={{commit}}' -o bin/tui ./cmd/tui
 
 # Build TUI for all platforms (linux/darwin/windows, amd64/arm64)
