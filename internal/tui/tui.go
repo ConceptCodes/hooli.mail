@@ -618,7 +618,10 @@ type groupInfo struct {
 }
 
 func (m *model) buildGroups() []groupInfo {
-	var currentGroup dateGroup
+	// Start from a sentinel no real group can equal, so the first message always
+	// initialises `current` rather than appending to an unlabelled group.
+	const groupNone dateGroup = -1
+	currentGroup := groupNone
 	var groups []groupInfo
 	var current groupInfo
 

@@ -53,6 +53,27 @@ func TestClassifyGroup(t *testing.T) {
 	}
 }
 
+func TestBuildGroupsBucketsByDate(t *testing.T) {
+	m := newTestModel(t, &fakeSession{})
+	now := time.Now()
+	m.emails = []mail.Summary{
+		{UID: 1, Date: now},
+		{UID: 2, Date: now.Add(-1 * time.Hour)},
+		{UID: 3, Date: now.AddDate(0, 0, -1)},
+		{UID: 4, Date: now.AddDate(0, 0, -20)},
+	}
+	groups := m.buildGroups()
+	if len(groups) != 3 {
+		t.Fatalf("groups = %d, want 3", len(groups))
+	}
+	if groups[0].label != "Today" || len(groups[0].indices) != 2 {
+		t.Errorf("first group = %+v", groups[0])
+	}
+	if groups[2].label != "Earlier" {
+		t.Errorf("last group = %+v", groups[2])
+	}
+}
+
 func TestRenderRowWaxSealOnlyWhenUnseen(t *testing.T) {
 	m := newTestModel(t, &fakeSession{})
 	m.emails = []mail.Summary{
