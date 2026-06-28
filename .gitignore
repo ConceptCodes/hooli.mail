@@ -3,3 +3,5 @@ notes.md
 bin/
 certs/
 .DS_Store
+server
+tui
