@@ -97,6 +97,7 @@ func New(server string, insecure bool, cfg config.Config) *model {
 	ei.Focus()
 	ei.Width = 36
 	ei.Prompt = ""
+	ei.PromptStyle = lipgloss.NewStyle()
 	ei.TextStyle = s.Primary
 	ei.PlaceholderStyle = s.Muted
 	ei.Cursor.Style = s.Seal
@@ -106,6 +107,7 @@ func New(server string, insecure bool, cfg config.Config) *model {
 	pi.Width = 36
 	pi.EchoMode = textinput.EchoPassword
 	pi.Prompt = ""
+	pi.PromptStyle = lipgloss.NewStyle()
 	pi.TextStyle = s.Primary
 	pi.PlaceholderStyle = s.Muted
 	pi.Cursor.Style = s.Seal
@@ -114,6 +116,7 @@ func New(server string, insecure bool, cfg config.Config) *model {
 	ct.Placeholder = "recipient@example.com"
 	ct.Width = 50
 	ct.Prompt = ""
+	ct.PromptStyle = lipgloss.NewStyle()
 	ct.TextStyle = s.Primary
 	ct.PlaceholderStyle = s.Muted
 	ct.Cursor.Style = s.Seal
@@ -122,6 +125,7 @@ func New(server string, insecure bool, cfg config.Config) *model {
 	cs.Placeholder = "subject"
 	cs.Width = 50
 	cs.Prompt = ""
+	cs.PromptStyle = lipgloss.NewStyle()
 	cs.TextStyle = s.Primary
 	cs.PlaceholderStyle = s.Muted
 	cs.Cursor.Style = s.Seal
@@ -793,7 +797,9 @@ func (m *model) inboxView() string {
 	footer := m.styles.Footer.Render(formatInboxFooter())
 	rows = append(rows, footer)
 
-	return lipgloss.JoinVertical(lipgloss.Left, rows...)
+	return lipgloss.NewStyle().Width(m.width).Height(m.height).Render(
+		lipgloss.JoinVertical(lipgloss.Left, rows...),
+	)
 }
 
 func formatInboxFooter() string {
@@ -937,17 +943,19 @@ func (m *model) messageView() string {
 
 	footer := m.styles.Footer.Render(formatMessageFooter())
 
-	return lipgloss.JoinVertical(lipgloss.Left,
-		"  "+back,
-		"",
-		subject,
-		"",
-		"  "+metaFrom,
-		"  "+metaTo,
-		"  "+metaDate,
-		m.styles.Muted.Render(strings.Repeat("\u2500", max(0, contentW-4))),
-		m.viewport.View(),
-		footer,
+	return lipgloss.NewStyle().Width(m.width).Height(m.height).Render(
+		lipgloss.JoinVertical(lipgloss.Left,
+			"  "+back,
+			"",
+			subject,
+			"",
+			"  "+metaFrom,
+			"  "+metaTo,
+			"  "+metaDate,
+			m.styles.Muted.Render(strings.Repeat("\u2500", max(0, contentW-4))),
+			m.viewport.View(),
+			footer,
+		),
 	)
 }
 
