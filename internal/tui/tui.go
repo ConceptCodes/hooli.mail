@@ -337,18 +337,18 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, cmd)
 		case 2:
 			if keyMsg, ok := msg.(tea.KeyMsg); ok {
-				switch keyMsg.String() {
-				case "backspace":
+				switch keyMsg.Type {
+				case tea.KeyRunes:
+					m.composeBody += string(keyMsg.Runes)
+				case tea.KeySpace:
+					m.composeBody += " "
+				case tea.KeyBackspace:
 					if len(m.composeBody) > 0 {
 						runes := []rune(m.composeBody)
 						m.composeBody = string(runes[:len(runes)-1])
 					}
-			case "enter":
-				m.composeBody += "\n"
-			default:
-					if len(keyMsg.String()) == 1 {
-						m.composeBody += keyMsg.String()
-					}
+				case tea.KeyEnter:
+					m.composeBody += "\n"
 				}
 			}
 		}
