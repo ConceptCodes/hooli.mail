@@ -7,7 +7,7 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /build/server ./cmd/server
+RUN mkdir -p /build/bin && CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /build/bin/server ./cmd/server
 
 FROM alpine:3.21
 
@@ -17,7 +17,7 @@ RUN adduser -D -h /app hooli
 USER hooli
 WORKDIR /app
 
-COPY --from=builder /build/server .
+COPY --from=builder /build/bin/server .
 
 EXPOSE 80 143 587 993 2525
 
