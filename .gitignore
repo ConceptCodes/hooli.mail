@@ -1,0 +1,5 @@
+notes.md
+.env
+bin/
+certs/
+.DS_Store

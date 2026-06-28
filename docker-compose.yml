@@ -1,0 +1,38 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: hooli
+      POSTGRES_PASSWORD: hooli
+      POSTGRES_DB: hoolimail
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hooli -d hoolimail"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  mailserver:
+    build: .
+    ports:
+      - "80:80"
+      - "143:143"
+      - "587:587"
+      - "993:993"
+      - "2525:2525"
+    environment:
+      DOMAIN: "${DOMAIN:?Set DOMAIN to your mail server hostname}"
+      ACME_EMAIL: "${ACME_EMAIL:-admin@${DOMAIN}}"
+      DSN: "postgres://hooli:hooli@postgres:5432/hoolimail?sslmode=disable"
+      SEED_EMAIL: "${SEED_EMAIL}"
+      SEED_PASS: "${SEED_PASS}"
+    volumes:
+      - certs:/app/certs
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  certs:
