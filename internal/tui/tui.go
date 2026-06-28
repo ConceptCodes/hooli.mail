@@ -16,6 +16,7 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/lipgloss"
 )
 
@@ -936,8 +937,18 @@ func (m *model) messageView() string {
 	metaDate := fmt.Sprintf("%s %s", m.styles.MetaLabel.Render("Date:"), m.styles.Secondary.Render(m.viewing.date.Format("Mon 2 Jan 2006 at 15:04")))
 
 	bodyW := contentW - 4
-	wrapped := lipgloss.NewStyle().Width(bodyW).Render(m.viewing.body)
-	m.viewport.SetContent(wrapped)
+	body := m.viewing.body
+	renderer, err := glamour.NewTermRenderer(
+		glamour.WithAutoStyle(),
+		glamour.WithWordWrap(bodyW),
+	)
+	if err == nil {
+		rendered, rerr := renderer.Render(body)
+		if rerr == nil {
+			body = rendered
+		}
+	}
+	m.viewport.SetContent(body)
 	m.viewport.Width = bodyW
 	m.viewport.Height = m.height - 12
 
