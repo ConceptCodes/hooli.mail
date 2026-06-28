@@ -1,0 +1,22 @@
+{
+  "theme": {
+    "dark": {
+      "ink": "#ebebeb",
+      "faint": "#666666",
+      "seal": "#e58e3c",
+      "error": "#e04f5f"
+    },
+    "light": {
+      "ink": "#000000",
+      "faint": "#888888",
+      "seal": "#c05a10",
+      "error": "#b91c1c"
+    }
+  },
+  "server": "mail.example.com",
+  "insecure": false,
+  "date_format": "relative",
+  "signature": "\n--\nSent from Hooli Mail",
+  "poll_seconds": 30,
+  "page_size": 50
+}
