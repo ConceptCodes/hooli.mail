@@ -1,18 +1,14 @@
 package tui
 
 import (
-	"bytes"
-	"crypto/tls"
+	"context"
 	"fmt"
-	"net"
-	"net/smtp"
 	"strings"
 	"time"
 
 	"hooli.mail/server/internal/config"
+	"hooli.mail/server/internal/tui/mail"
 
-	imap "github.com/emersion/go-imap"
-	imapclient "github.com/emersion/go-imap/client"
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
@@ -29,22 +25,6 @@ const (
 	composeView
 )
 
-type emailSummary struct {
-	uid     uint32
-	from    string
-	subject string
-	date    time.Time
-	seen    bool
-}
-
-type fullEmail struct {
-	from    string
-	to      []string
-	subject string
-	body    string
-	date    time.Time
-}
-
 type dateGroup int
 
 const (
@@ -54,6 +34,10 @@ const (
 	groupEarlier
 )
 
+// model is the Bubble Tea model. It holds view state only: all mail-server
+// interaction goes through the mail.Session seam, so this struct carries no
+// live sockets and no command mutates it from a goroutine. Commands return
+// data via messages; Update is the only place state changes.
 type model struct {
 	state view
 
@@ -71,12 +55,13 @@ type model struct {
 	passwordInput textinput.Model
 	loggedInUser  string
 
-	emails []emailSummary
-	cursor int
-	total  int
-	offset int
+	session mail.Session
+	emails  []mail.Summary
+	cursor  int
+	total   int
+	offset  int
 
-	viewing  *fullEmail
+	viewing *mail.Full
 	viewport viewport.Model
 
 	composeTo      textinput.Model
@@ -87,10 +72,15 @@ type model struct {
 
 	err     error
 	loading string
-	client  *imapclient.Client
 }
 
+// New builds a TUI model backed by a real IMAP/SMTP session.
 func New(server string, insecure bool, cfg config.Config) *model {
+	return newWithSession(mail.NewIMAPSession(server, insecure), server, insecure, cfg)
+}
+
+// newWithSession lets tests inject a fake Session behind the seam.
+func newWithSession(session mail.Session, server string, insecure bool, cfg config.Config) *model {
 	s := NewStyles(cfg)
 
 	ei := textinput.New()
@@ -138,6 +128,7 @@ func New(server string, insecure bool, cfg config.Config) *model {
 		styles:         s,
 		server:         server,
 		insecure:       insecure,
+		session:        session,
 		emailInput:     ei,
 		passwordInput:  pi,
 		composeTo:      ct,
@@ -230,7 +221,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if len(m.emails) > 0 && m.cursor >= 0 && m.cursor < len(m.emails) {
 					m.state = messageView
 					m.viewing = nil
-					return m, m.fetchMessage(m.emails[m.cursor].uid)
+					return m, m.fetchMessage(m.emails[m.cursor].UID)
 				}
 			}
 		case "tab":
@@ -274,7 +265,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.ensureVisible()
 			}
 		case "r":
-			if m.state == inboxView && m.client != nil {
+			if m.state == inboxView && m.session != nil {
 				m.loading = "Refreshing"
 				return m, m.refreshInbox()
 			}
@@ -306,12 +297,32 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.loading = ""
 		m.err = nil
 		m.state = inboxView
+		m.loggedInUser = m.username
 		m.cursor = 0
 		m.offset = 0
+		m.emails = msg.emails
+		m.total = len(msg.emails)
+
+	case inboxLoaded:
+		m.loading = ""
+		m.err = nil
+		m.emails = msg.emails
+		m.total = len(msg.emails)
 
 	case messageLoaded:
 		m.loading = ""
 		m.viewing = msg.email
+		for i := range m.emails {
+			if m.emails[i].UID == msg.uid {
+				m.emails[i].Seen = true
+				break
+			}
+		}
+
+	case sentMsg:
+		m.state = inboxView
+		m.loading = "Refreshing"
+		return m, m.refreshInbox()
 	}
 
 	switch m.state {
@@ -406,282 +417,58 @@ func (m *model) ensureVisible() {
 	}
 }
 
-func (m *model) connectIMAP() (*imapclient.Client, error) {
-	if m.insecure {
-		c, err := imapclient.Dial(net.JoinHostPort(m.server, "143"))
-		if err != nil {
-			return nil, fmt.Errorf("cannot reach %s:143", m.server)
-		}
-		return c, nil
-	}
-
-	tlsCfg := &tls.Config{
-		ServerName:         m.server,
-		InsecureSkipVerify: true,
-	}
-
-	if c, err := imapclient.DialTLS(net.JoinHostPort(m.server, "993"), tlsCfg); err == nil {
-		return c, nil
-	}
-
-	c, err := imapclient.Dial(net.JoinHostPort(m.server, "143"))
-	if err == nil {
-		if err := c.StartTLS(tlsCfg); err == nil {
-			return c, nil
-		}
-		c.Logout()
-	}
-
-	return nil, fmt.Errorf("cannot connect to %s (IMAP 993/143)", m.server)
-}
+// --- commands ---
+//
+// Each command performs one session call and returns a message carrying the
+// result. None of them mutate the model: that happens in Update when the
+// message is received, which keeps view state single-threaded.
 
 func (m *model) login() tea.Cmd {
+	user := m.username
+	pass := m.password
+	session := m.session
 	return func() tea.Msg {
-		c, err := m.connectIMAP()
+		emails, err := session.Login(context.Background(), user, pass)
 		if err != nil {
 			return errMsg{err: err}
 		}
-
-		if err := c.Login(m.username, m.password); err != nil {
-			return errMsg{err: fmt.Errorf("invalid credentials")}
-		}
-
-		m.client = c
-		m.loggedInUser = m.username
-
-		mbox, err := c.Select("INBOX", false)
-		if err != nil {
-			return errMsg{err: fmt.Errorf("cannot open inbox")}
-		}
-
-		if mbox.Messages == 0 {
-			m.emails = nil
-			return loginSuccess{}
-		}
-
-		seqSet := new(imap.SeqSet)
-		seqSet.AddRange(1, mbox.Messages)
-
-		messages := make(chan *imap.Message, 10)
-		done := make(chan error, 1)
-		go func() {
-			done <- c.Fetch(seqSet, []imap.FetchItem{imap.FetchEnvelope, imap.FetchFlags}, messages)
-		}()
-
-		var emails []emailSummary
-		for msg := range messages {
-			seen := false
-			for _, flag := range msg.Flags {
-				if flag == imap.SeenFlag {
-					seen = true
-					break
-				}
-			}
-
-			from := ""
-			if msg.Envelope != nil && len(msg.Envelope.From) > 0 {
-				f := msg.Envelope.From[0]
-				from = f.MailboxName + "@" + f.HostName
-				if f.PersonalName != "" {
-					from = f.PersonalName
-				}
-			}
-
-			subject := ""
-			if msg.Envelope != nil {
-				subject = msg.Envelope.Subject
-			}
-
-			emails = append(emails, emailSummary{
-				uid:     msg.Uid,
-				from:    from,
-				subject: subject,
-				date:    msg.Envelope.Date,
-				seen:    seen,
-			})
-		}
-		<-done
-
-		m.emails = emails
-		m.total = len(emails)
-		return loginSuccess{}
+		return loginSuccess{emails: emails}
 	}
 }
 
 func (m *model) refreshInbox() tea.Cmd {
+	session := m.session
 	return func() tea.Msg {
-		if m.client == nil {
-			return errMsg{err: fmt.Errorf("not connected")}
-		}
-
-		mbox, err := m.client.Select("INBOX", false)
+		emails, err := session.Refresh(context.Background())
 		if err != nil {
-			return errMsg{err: fmt.Errorf("cannot open inbox")}
+			return errMsg{err: err}
 		}
-
-		if mbox.Messages == 0 {
-			m.emails = nil
-			m.total = 0
-			return loginSuccess{}
-		}
-
-		seqSet := new(imap.SeqSet)
-		seqSet.AddRange(1, mbox.Messages)
-
-		messages := make(chan *imap.Message, 10)
-		done := make(chan error, 1)
-		go func() {
-			done <- m.client.Fetch(seqSet, []imap.FetchItem{imap.FetchEnvelope, imap.FetchFlags}, messages)
-		}()
-
-		var emails []emailSummary
-		for msg := range messages {
-			seen := false
-			for _, flag := range msg.Flags {
-				if flag == imap.SeenFlag {
-					seen = true
-					break
-				}
-			}
-
-			from := ""
-			if msg.Envelope != nil && len(msg.Envelope.From) > 0 {
-				f := msg.Envelope.From[0]
-				from = f.MailboxName + "@" + f.HostName
-				if f.PersonalName != "" {
-					from = f.PersonalName
-				}
-			}
-
-			subject := ""
-			if msg.Envelope != nil {
-				subject = msg.Envelope.Subject
-			}
-
-			emails = append(emails, emailSummary{
-				uid:     msg.Uid,
-				from:    from,
-				subject: subject,
-				date:    msg.Envelope.Date,
-				seen:    seen,
-			})
-		}
-		<-done
-
-		m.emails = emails
-		m.total = len(emails)
-		return loginSuccess{}
+		return inboxLoaded{emails: emails}
 	}
 }
 
 func (m *model) fetchMessage(uid uint32) tea.Cmd {
+	session := m.session
 	return func() tea.Msg {
-		if m.client == nil {
-			return errMsg{err: fmt.Errorf("not connected")}
-		}
-
-		seqSet := new(imap.SeqSet)
-		seqSet.AddNum(uid)
-
-		section := &imap.BodySectionName{}
-		section.Specifier = imap.TextSpecifier
-		items := []imap.FetchItem{section.FetchItem(), imap.FetchEnvelope, imap.FetchFlags}
-
-		messages := make(chan *imap.Message, 1)
-		done := make(chan error, 1)
-		go func() {
-			done <- m.client.UidFetch(seqSet, items, messages)
-		}()
-
-		msg := <-messages
-		err := <-done
+		full, err := session.Fetch(context.Background(), uid)
 		if err != nil {
-			return errMsg{err: fmt.Errorf("cannot fetch message")}
+			return errMsg{err: err}
 		}
-		if msg == nil {
-			return errMsg{err: fmt.Errorf("message not found")}
-		}
-
-		body := ""
-		for sectionName, literal := range msg.Body {
-			if sectionName.Specifier == imap.TextSpecifier || sectionName.Specifier == imap.EntireSpecifier {
-				buf := new(bytes.Buffer)
-				buf.ReadFrom(literal)
-				body = buf.String()
-				break
-			}
-		}
-		if body == "" {
-			for _, literal := range msg.Body {
-				buf := new(bytes.Buffer)
-				buf.ReadFrom(literal)
-				body = buf.String()
-				break
-			}
-		}
-
-		var to []string
-		if msg.Envelope != nil {
-			for _, addr := range msg.Envelope.To {
-				to = append(to, addr.MailboxName+"@"+addr.HostName)
-			}
-		}
-
-		from := ""
-		if msg.Envelope != nil && len(msg.Envelope.From) > 0 {
-			f := msg.Envelope.From[0]
-			from = f.MailboxName + "@" + f.HostName
-			if f.PersonalName != "" {
-				from = f.PersonalName + " <" + from + ">"
-			}
-		}
-
-		seqSet2 := new(imap.SeqSet)
-		seqSet2.AddNum(uid)
-		m.client.UidStore(seqSet2, imap.FormatFlagsOp(imap.AddFlags, false), []interface{}{imap.SeenFlag}, nil)
-
-		for i := range m.emails {
-			if m.emails[i].uid == uid {
-				m.emails[i].seen = true
-				break
-			}
-		}
-
-		em := &fullEmail{
-			from:    from,
-			to:      to,
-			subject: msg.Envelope.Subject,
-			body:    strings.TrimSpace(body),
-			date:    msg.Envelope.Date,
-		}
-
-		return messageLoaded{email: em}
+		return messageLoaded{email: full, uid: uid}
 	}
 }
 
 func (m *model) sendMail() tea.Cmd {
+	to := strings.TrimSpace(m.composeTo.Value())
+	subject := strings.TrimSpace(m.composeSubject.Value())
+	body := strings.TrimSpace(m.composeBody)
+	session := m.session
+	out := mail.Outgoing{To: to, Subject: subject, Body: body}
 	return func() tea.Msg {
-		to := strings.TrimSpace(m.composeTo.Value())
-		subject := strings.TrimSpace(m.composeSubject.Value())
-		body := strings.TrimSpace(m.composeBody)
-
-		if to == "" {
-			return errMsg{err: fmt.Errorf("recipient required")}
+		if err := session.Send(context.Background(), out); err != nil {
+			return errMsg{err: err}
 		}
-
-		host := m.server
-		smtpAuth := smtp.PlainAuth("", m.username, m.password, host)
-
-		msg := fmt.Sprintf("From: %s\r\nTo: %s\r\nSubject: %s\r\n\r\n%s",
-			m.username, to, subject, body)
-
-		addr := net.JoinHostPort(host, "587")
-		if err := smtp.SendMail(addr, smtpAuth, m.username, strings.Split(to, ","), []byte(msg)); err != nil {
-			return errMsg{err: fmt.Errorf("send failed")}
-		}
-
-		m.state = inboxView
-		return m.refreshInbox()
+		return sentMsg{}
 	}
 }
 
@@ -836,7 +623,7 @@ func (m *model) buildGroups() []groupInfo {
 	var current groupInfo
 
 	for i, e := range m.emails {
-		g := classifyGroup(e.date)
+		g := classifyGroup(e.Date)
 		if g != currentGroup {
 			if current.label != "" {
 				groups = append(groups, current)
@@ -857,7 +644,7 @@ func (m *model) buildGroups() []groupInfo {
 	return groups
 }
 
-func (m *model) renderRow(email emailSummary, selected bool, width int) string {
+func (m *model) renderRow(email mail.Summary, selected bool, width int) string {
 	fromW := 20
 	dateW := 10
 	subjW := width - 2 - fromW - dateW - 4
@@ -866,11 +653,11 @@ func (m *model) renderRow(email emailSummary, selected bool, width int) string {
 	}
 
 	seal := "  "
-	if !email.seen {
+	if !email.Seen {
 		seal = m.styles.Seal.Render("\u2588\u2588")
 	}
 
-	from := email.from
+	from := email.From
 	if from == "" {
 		from = "(unknown)"
 	}
@@ -878,7 +665,7 @@ func (m *model) renderRow(email emailSummary, selected bool, width int) string {
 		from = string([]rune(from)[:fromW-1]) + "\u2026"
 	}
 
-	subject := email.subject
+	subject := email.Subject
 	if subject == "" {
 		subject = "(no subject)"
 	}
@@ -886,19 +673,19 @@ func (m *model) renderRow(email emailSummary, selected bool, width int) string {
 		subject = string([]rune(subject)[:subjW-1]) + "\u2026"
 	}
 
-	age := time.Since(email.date)
+	age := time.Since(email.Date)
 	var dateStr string
 	switch {
 	case age < 24*time.Hour:
-		dateStr = email.date.Format("15:04")
+		dateStr = email.Date.Format("15:04")
 	case age < 7*24*time.Hour:
-		dateStr = email.date.Format("Mon")
+		dateStr = email.Date.Format("Mon")
 	default:
-		dateStr = email.date.Format("Jan 02")
+		dateStr = email.Date.Format("Jan 02")
 	}
 
 	var line string
-	if !email.seen {
+	if !email.Seen {
 		fromPadded := fmt.Sprintf("%-*s", fromW, from)
 		subjPadded := fmt.Sprintf("%-*s", subjW, subject)
 		line = seal + " " +
@@ -930,14 +717,14 @@ func (m *model) messageView() string {
 
 	back := m.styles.Secondary.Render("\u2190  ") + m.styles.Muted.Render("Inbox")
 
-	subject := m.styles.Subject.Render(m.viewing.subject)
+	subject := m.styles.Subject.Render(m.viewing.Subject)
 
-	metaFrom := fmt.Sprintf("%s %s", m.styles.MetaLabel.Render("From:"), m.styles.Secondary.Render(m.viewing.from))
-	metaTo := fmt.Sprintf("%s %s", m.styles.MetaLabel.Render("To:"), m.styles.Secondary.Render(strings.Join(m.viewing.to, ", ")))
-	metaDate := fmt.Sprintf("%s %s", m.styles.MetaLabel.Render("Date:"), m.styles.Secondary.Render(m.viewing.date.Format("Mon 2 Jan 2006 at 15:04")))
+	metaFrom := fmt.Sprintf("%s %s", m.styles.MetaLabel.Render("From:"), m.styles.Secondary.Render(m.viewing.From))
+	metaTo := fmt.Sprintf("%s %s", m.styles.MetaLabel.Render("To:"), m.styles.Secondary.Render(strings.Join(m.viewing.To, ", ")))
+	metaDate := fmt.Sprintf("%s %s", m.styles.MetaLabel.Render("Date:"), m.styles.Secondary.Render(m.viewing.Date.Format("Mon 2 Jan 2006 at 15:04")))
 
 	bodyW := contentW - 4
-	body := m.viewing.body
+	body := m.viewing.Body
 	renderer, err := glamour.NewTermRenderer(
 		glamour.WithAutoStyle(),
 		glamour.WithWordWrap(bodyW),
@@ -1012,11 +799,22 @@ func formatComposeFooter() string {
 	return "\u2022 tab next  \u2022 enter newline  \u2022 ^S send  \u2022 esc cancel"
 }
 
-type loginSuccess struct{}
+// --- messages ---
+
+type loginSuccess struct {
+	emails []mail.Summary
+}
+
+type inboxLoaded struct {
+	emails []mail.Summary
+}
 
 type messageLoaded struct {
-	email *fullEmail
+	email *mail.Full
+	uid   uint32
 }
+
+type sentMsg struct{}
 
 type errMsg struct {
 	err error
