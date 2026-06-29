@@ -6,6 +6,7 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"hooli.mail/server/internal/mailstore"
@@ -75,7 +76,7 @@ func (s *Store) GetUserByEmail(ctx context.Context, email string) (*models.User,
 		email,
 	).Scan(&u.ID, &u.Email, &u.PasswordHash, &u.CreatedAt)
 	if err != nil {
-		if err == pgx.ErrNoRows {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("get user: %w", err)
@@ -124,7 +125,7 @@ func (s *Store) GetMailboxByName(ctx context.Context, userID int64, name string)
 		userID, name,
 	).Scan(&mb.ID, &mb.UserID, &mb.Name, &mb.CreatedAt)
 	if err != nil {
-		if err == pgx.ErrNoRows {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("get mailbox: %w", err)
@@ -133,13 +134,17 @@ func (s *Store) GetMailboxByName(ctx context.Context, userID int64, name string)
 }
 
 func (s *Store) DeleteMailbox(ctx context.Context, id int64) error {
-	_, err := s.pool.Exec(ctx, `DELETE FROM mailboxes WHERE id = $1`, id)
-	return fmt.Errorf("delete mailbox: %w", err)
+	if _, err := s.pool.Exec(ctx, `DELETE FROM mailboxes WHERE id = $1`, id); err != nil {
+		return fmt.Errorf("delete mailbox: %w", err)
+	}
+	return nil
 }
 
 func (s *Store) RenameMailbox(ctx context.Context, id int64, newName string) error {
-	_, err := s.pool.Exec(ctx, `UPDATE mailboxes SET name = $1 WHERE id = $2`, newName, id)
-	return fmt.Errorf("rename mailbox: %w", err)
+	if _, err := s.pool.Exec(ctx, `UPDATE mailboxes SET name = $1 WHERE id = $2`, newName, id); err != nil {
+		return fmt.Errorf("rename mailbox: %w", err)
+	}
+	return nil
 }
 
 // Status computes all IMAP mailbox counters in one place. \Recent and unseen
@@ -150,9 +155,9 @@ func (s *Store) Status(ctx context.Context, mailboxID int64) (mailstore.Status, 
 	st.UIDValidity = 1
 
 	queries := []struct {
-		sql   string
-		flag  string
-		dst   *uint32
+		sql  string
+		flag string
+		dst  *uint32
 	}{
 		{`SELECT COUNT(*) FROM emails WHERE mailbox_id = $1`, "", &st.Messages},
 		{`SELECT COUNT(*) FROM emails WHERE mailbox_id = $1 AND $2 = ANY(flags)`, models.FlagRecent, &st.Recent},
@@ -235,16 +240,20 @@ func (s *Store) List(ctx context.Context, mailboxID int64) ([]models.Email, erro
 }
 
 func (s *Store) SetFlags(ctx context.Context, emailID int64, flags []string) error {
-	_, err := s.pool.Exec(ctx,
+	if _, err := s.pool.Exec(ctx,
 		`UPDATE emails SET flags = $1 WHERE id = $2`,
 		flags, emailID,
-	)
-	return fmt.Errorf("set flags: %w", err)
+	); err != nil {
+		return fmt.Errorf("set flags: %w", err)
+	}
+	return nil
 }
 
 func (s *Store) DeleteMessage(ctx context.Context, emailID int64) error {
-	_, err := s.pool.Exec(ctx, `DELETE FROM emails WHERE id = $1`, emailID)
-	return fmt.Errorf("delete email: %w", err)
+	if _, err := s.pool.Exec(ctx, `DELETE FROM emails WHERE id = $1`, emailID); err != nil {
+		return fmt.Errorf("delete email: %w", err)
+	}
+	return nil
 }
 
 // Expunge removes every message in the Mailbox carrying \Deleted in a single
@@ -281,7 +290,7 @@ func (s *Store) Copy(ctx context.Context, srcMailboxID int64, ids []int64, destM
 
 	type src struct {
 		from, subject, body string
-		to, flags            []string
+		to, flags           []string
 	}
 	var msgs []src
 	for rows.Next() {
