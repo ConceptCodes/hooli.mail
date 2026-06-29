@@ -29,7 +29,7 @@ type Backend struct {
 	ctx         context.Context
 }
 
-func NewBackend(store mailstore.Store, authn *auth.Authenticator, requireAuth bool, ctx context.Context) *Backend {
+func NewBackend(ctx context.Context, store mailstore.Store, authn *auth.Authenticator, requireAuth bool) *Backend {
 	return &Backend{store: store, authn: authn, requireAuth: requireAuth, ctx: ctx}
 }
 
@@ -161,10 +161,15 @@ func (s *Session) deliver(recipientEmail string, parsed message.Parsed) error {
 	return err
 }
 
+// Reset aborts the current mail transaction. Per RFC 5321 §4.1.1.5, RSET
+// clears the MAIL FROM / RCPT TO state and the data buffer — it must NOT
+// invalidate the AUTHENTICATED state. Clearing s.user here previously let an
+// authenticated client who sent RSET keep submitting without re-AUTH, but a
+// subsequent MAIL FROM on a requireAuth backend would have been rejected as
+// unauthenticated, which is wrong: RSET is a transaction reset, not a logout.
 func (s *Session) Reset() {
 	s.from = ""
 	s.to = nil
-	s.user = nil
 }
 
 func (s *Session) Logout() error {
@@ -180,9 +185,9 @@ type Server struct {
 // The context is propagated to every session so that cancellation (shutdown,
 // timeout) reaches in-flight DB calls. When tlsCfg is nil, secure auth is
 // refused — clients must use TLS for any SASL mechanism that ships credentials.
-func NewServer(store mailstore.Store, authn *auth.Authenticator, addr string, tlsCfg *tls.Config, requireAuth bool, ctx context.Context) *Server {
+func NewServer(ctx context.Context, store mailstore.Store, authn *auth.Authenticator, addr string, tlsCfg *tls.Config, requireAuth bool) *Server {
 	sessionCtx, cancel := context.WithCancel(ctx)
-	backend := NewBackend(store, authn, requireAuth, sessionCtx)
+	backend := NewBackend(sessionCtx, store, authn, requireAuth)
 	srv := gosmtp.NewServer(backend)
 	srv.Addr = addr
 	srv.Domain = "hooli.mail"
@@ -213,5 +218,7 @@ func (s *Server) Start() error {
 
 func (s *Server) Stop() {
 	s.cancel()
-	s.srv.Close()
+	// go-smtp's Close errors only on double-close — safe to ignore during
+	// shutdown.
+	_ = s.srv.Close()
 }
