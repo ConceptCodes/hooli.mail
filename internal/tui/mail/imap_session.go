@@ -182,13 +182,30 @@ func (s *IMAPSession) Send(ctx context.Context, out Outgoing) error {
 		return fmt.Errorf("recipient required")
 	}
 
-	msg := fmt.Sprintf("From: %s\r\nTo: %s\r\nSubject: %s\r\n\r\n%s",
-		s.sender(), to, out.Subject, out.Body)
+	// Build message headers. Bcc is envelope-only — it must NOT appear
+	// in the message headers, otherwise every recipient can see who was
+	// blind-carbon-copied.
+	headers := fmt.Sprintf("From: %s\r\nTo: %s\r\nSubject: %s\r\n",
+		s.sender(), to, out.Subject)
+	if cc := strings.TrimSpace(out.Cc); cc != "" {
+		headers += fmt.Sprintf("Cc: %s\r\n", cc)
+	}
+	msg := headers + "\r\n" + out.Body
+
+	// Collect all envelope recipients: To + Cc + Bcc. Every one needs a
+	// RCPT TO in the SMTP transaction.
+	recipients := splitAndTrim(to)
+	if cc := strings.TrimSpace(out.Cc); cc != "" {
+		recipients = append(recipients, splitAndTrim(cc)...)
+	}
+	if bcc := strings.TrimSpace(out.Bcc); bcc != "" {
+		recipients = append(recipients, splitAndTrim(bcc)...)
+	}
 
 	addr := net.JoinHostPort(s.server, s.submissionPort)
 	done := make(chan error, 1)
 	go func() {
-		done <- smtp.SendMail(addr, s.submissionAuth, s.sender(), strings.Split(to, ","), []byte(msg))
+		done <- smtp.SendMail(addr, s.submissionAuth, s.sender(), recipients, []byte(msg))
 	}()
 	select {
 	case err := <-done:
@@ -199,6 +216,20 @@ func (s *IMAPSession) Send(ctx context.Context, out Outgoing) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// splitAndTrim splits a comma-separated address list and trims whitespace
+// from each element, dropping empties.
+func splitAndTrim(s string) []string {
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func (s *IMAPSession) Logout(ctx context.Context) error {

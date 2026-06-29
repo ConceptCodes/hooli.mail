@@ -36,6 +36,8 @@ type Full struct {
 // Outgoing is a message being sent.
 type Outgoing struct {
 	To      string
+	Cc      string
+	Bcc     string
 	Subject string
 	Body    string
 }
