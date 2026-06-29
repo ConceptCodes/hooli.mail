@@ -58,9 +58,16 @@ type model struct {
 	loggedInUser  string
 
 	session mail.Session
-	emails  []mail.Summary
-	cursor  int
-	total   int
+
+	// ctx is the root context for all session calls. It is cancelled on quit
+	// so any in-flight IMAP/SMTP operation returns promptly instead of
+	// hanging forever against an unresponsive server.
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	emails []mail.Summary
+	cursor int
+	total  int
 
 	viewing  *mail.Full
 	viewport viewport.Model
@@ -78,13 +85,25 @@ type model struct {
 	draftsCursor int
 }
 
-// New builds a TUI model backed by a real IMAP/SMTP session.
+// New builds a TUI model backed by a real IMAP/SMTP session. The returned
+// model's session is the same IMAPSession the caller would obtain from
+// NewWithSession, so the caller can still call Logout on it after Run().
+//
+// NewWithSession is preferred in production: pass an externally-built
+// mail.Session (the real *mail.IMAPSession) so the caller can clean it up
+// after the program exits.
+//
+//nolint:revive // unexported-return: returning *model is deliberate — callers use it via tea.Model and the type stays opaque.
 func New(server string, insecure bool, cfg config.Config) *model {
-	return newWithSession(mail.NewIMAPSession(server, insecure), server, insecure, cfg)
+	return NewWithSession(mail.NewIMAPSession(server, insecure), server, insecure, cfg)
 }
 
-// newWithSession lets tests inject a fake Session behind the seam.
-func newWithSession(session mail.Session, server string, insecure bool, cfg config.Config) *model {
+// NewWithSession lets tests inject a fake Session behind the seam, and lets
+// the caller (cmd/tui) retain a reference to the session so Logout can run
+// after the Bubble Tea program returns.
+//
+//nolint:revive // unexported-return: see New.
+func NewWithSession(session mail.Session, server string, insecure bool, cfg config.Config) *model {
 	s := NewStyles(cfg)
 
 	ei := textinput.New()
@@ -127,12 +146,15 @@ func newWithSession(session mail.Session, server string, insecure bool, cfg conf
 
 	vp := viewport.New(80, 20)
 
+	ctx, cancel := context.WithCancel(context.Background())
 	return &model{
 		state:          loginView,
 		styles:         s,
 		server:         server,
 		insecure:       insecure,
 		session:        session,
+		ctx:            ctx,
+		cancel:         cancel,
 		emailInput:     ei,
 		passwordInput:  pi,
 		composeTo:      ct,
@@ -143,6 +165,25 @@ func newWithSession(session mail.Session, server string, insecure bool, cfg conf
 
 func (m *model) Init() tea.Cmd {
 	return textinput.Blink
+}
+
+// Logout closes the IMAP session synchronously. It is intended to be called
+// by cmd/tui after the Bubble Tea program returns, so the IMAP LOGOUT is
+// always sent instead of being dropped when the message loop shuts down. The
+// call is bounded: a server that doesn't reply to LOGOUT within 5s is
+// dropped.
+//
+// The method is exported even though the type isn't, because cmd/tui holds a
+// *model value returned by the exported NewWithSession and can call exported
+// methods on it.
+func (m *model) Logout() error {
+	m.cancel()
+	if m.session == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return m.session.Logout(ctx)
 }
 
 func classifyGroup(t time.Time) dateGroup {
@@ -189,13 +230,16 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "ctrl+c":
+			m.cancel()
 			return m, tea.Quit
 		case "ctrl+q":
 			if m.state == inboxView || m.state == loginView || m.state == draftsView {
+				m.cancel()
 				return m, tea.Quit
 			}
 		case "q":
 			if m.state == inboxView && len(m.emails) == 0 {
+				m.cancel()
 				return m, tea.Quit
 			}
 			if m.state == draftsView {
@@ -488,8 +532,9 @@ func (m *model) login() tea.Cmd {
 	user := m.username
 	pass := m.password
 	session := m.session
+	ctx := m.ctx
 	return func() tea.Msg {
-		emails, err := session.Login(context.Background(), user, pass)
+		emails, err := session.Login(ctx, user, pass)
 		if err != nil {
 			return errMsg{err: err}
 		}
@@ -499,8 +544,9 @@ func (m *model) login() tea.Cmd {
 
 func (m *model) refreshInbox() tea.Cmd {
 	session := m.session
+	ctx := m.ctx
 	return func() tea.Msg {
-		emails, err := session.Refresh(context.Background())
+		emails, err := session.Refresh(ctx)
 		if err != nil {
 			return errMsg{err: err}
 		}
@@ -510,8 +556,9 @@ func (m *model) refreshInbox() tea.Cmd {
 
 func (m *model) fetchMessage(uid uint32) tea.Cmd {
 	session := m.session
+	ctx := m.ctx
 	return func() tea.Msg {
-		full, err := session.Fetch(context.Background(), uid)
+		full, err := session.Fetch(ctx, uid)
 		if err != nil {
 			return errMsg{err: err}
 		}
@@ -524,9 +571,10 @@ func (m *model) sendMail() tea.Cmd {
 	subject := strings.TrimSpace(m.composeSubject.Value())
 	body := strings.TrimSpace(m.composeBody)
 	session := m.session
+	ctx := m.ctx
 	out := mail.Outgoing{To: to, Subject: subject, Body: body}
 	return func() tea.Msg {
-		if err := session.Send(context.Background(), out); err != nil {
+		if err := session.Send(ctx, out); err != nil {
 			return errMsg{err: err}
 		}
 		return sentMsg{}

@@ -21,12 +21,30 @@ func newBackend(t *testing.T, requireAuth bool) (*Backend, *memory.Store, *auth.
 	t.Helper()
 	store := memory.New()
 	authn := auth.NewAuthenticator(store)
-	return NewBackend(store, authn, requireAuth, context.Background()), store, authn
+	return NewBackend(context.Background(), store, authn, requireAuth), store, authn
 }
 
 func mustCreateUser(t *testing.T, store *memory.Store, email string) *models.User {
 	t.Helper()
 	u, err := store.CreateUser(context.Background(), email, "hash")
+	if err != nil {
+		t.Fatalf("create user %s: %v", email, err)
+	}
+	return u
+}
+
+// mustCreateUserWithPassword creates a user with a real bcrypt hash, so
+// AuthPlain against the resulting Authenticator works. We previously relied on
+// mutating the *models.User returned by CreateUser to install the hash — that
+// was a pointer leak the memory store now closes. Tests that exercise AuthPlain
+// must build the hash before CreateUser, not after.
+func mustCreateUserWithPassword(t *testing.T, store *memory.Store, email, password string) *models.User {
+	t.Helper()
+	hash, err := auth.HashPassword(password)
+	if err != nil {
+		t.Fatalf("hash %s: %v", email, err)
+	}
+	u, err := store.CreateUser(context.Background(), email, hash)
 	if err != nil {
 		t.Fatalf("create user %s: %v", email, err)
 	}
@@ -179,19 +197,15 @@ func TestSessionDataAllRecipientsFailReturnError(t *testing.T) {
 	}
 }
 
-// TestSessionResetClearsUser pins the hygiene fix: RSET used to leave
-// s.user intact after the connection's RSET, so a subsequent MAIL FROM
-// would still be authorised.
-func TestSessionResetClearsUser(t *testing.T) {
+// TestSessionResetPreservesAuthentication pins RFC 5321 §4.1.1.5: RSET
+// discards the current mail transaction (MAIL FROM, RCPT TO) but must not
+// invalidate AUTHENTICATED state. The previous implementation cleared s.user
+// on RSET, which forced an authenticated submitter to re-AUTH after every
+// RSET — a real client bug, not just a style nit.
+func TestSessionResetPreservesAuthentication(t *testing.T) {
 	t.Parallel()
 	b, store, _ := newBackend(t, true)
-	user := mustCreateUser(t, store, "alice@hooli.test")
-
-	hash, err := auth.HashPassword("wonderland")
-	if err != nil {
-		t.Fatalf("hash: %v", err)
-	}
-	user.PasswordHash = hash
+	mustCreateUserWithPassword(t, store, "alice@hooli.test", "wonderland")
 
 	session := &Session{backend: b, ctx: context.Background()}
 	if err := session.AuthPlain("alice@hooli.test", "wonderland"); err != nil {
@@ -200,12 +214,23 @@ func TestSessionResetClearsUser(t *testing.T) {
 	if session.user == nil {
 		t.Fatal("user nil after successful auth")
 	}
+
+	// Prime the transaction so Reset has something to clear.
+	if err := session.Mail("alice@hooli.test", &gosmtp.MailOptions{}); err != nil {
+		t.Fatalf("Mail: %v", err)
+	}
 	session.Reset()
-	if session.user != nil {
-		t.Error("user still set after Reset; want nil (RSET must clear auth)")
+
+	// RSET must keep the authenticated identity — the next MAIL FROM must
+	// succeed without another AUTH.
+	if session.user == nil {
+		t.Fatal("RSET cleared authentication; want auth preserved (RFC 5321 §4.1.1.5)")
 	}
 	if session.from != "" || len(session.to) != 0 {
-		t.Errorf("Reset left from=%q to=%v; want cleared", session.from, session.to)
+		t.Errorf("Reset left from=%q to=%v; want transaction state cleared", session.from, session.to)
+	}
+	if err := session.Mail("alice@hooli.test", &gosmtp.MailOptions{}); err != nil {
+		t.Errorf("MAIL FROM after RSET failed: %v (auth should still be valid)", err)
 	}
 }
 
@@ -214,12 +239,7 @@ func TestSessionResetClearsUser(t *testing.T) {
 func TestSessionAuthPlainWrongPassword(t *testing.T) {
 	t.Parallel()
 	b, store, _ := newBackend(t, true)
-	user := mustCreateUser(t, store, "alice@hooli.test")
-	hash, err := auth.HashPassword("wonderland")
-	if err != nil {
-		t.Fatalf("hash: %v", err)
-	}
-	user.PasswordHash = hash
+	mustCreateUserWithPassword(t, store, "alice@hooli.test", "wonderland")
 
 	session := &Session{backend: b, ctx: context.Background()}
 	if err := session.AuthPlain("alice@hooli.test", "wrong"); err == nil {
@@ -230,11 +250,13 @@ func TestSessionAuthPlainWrongPassword(t *testing.T) {
 	}
 }
 
-// TestSessionAppendReplacesMailboxTests is a coverage helper that the IMAP
-// adapter test file can reuse. We assert the mailstore.Store contract holds
-// here too so a backend regression is caught without a running server.
+// TestBackendSatisfiesMailstore is a coverage helper that the IMAP adapter
+// test file can reuse. We assert the mailstore.Store contract holds here
+// too so a backend regression is caught without a running server.
 func TestBackendSatisfiesMailstore(t *testing.T) {
 	t.Parallel()
 	b, _, _ := newBackend(t, false)
-	var _ mailstore.Store = b.store
+	// The explicit type annotation is the assertion — it forces a
+	// compile-time check that b.store satisfies mailstore.Store.
+	var _ mailstore.Store = b.store //nolint:staticcheck // QF1011: the type annotation is intentional
 }

@@ -23,7 +23,7 @@ func TestHeightFillAllViews(t *testing.T) {
 		},
 		full: &mail.Full{Subject: "hi", From: "a@x.com", To: []string{"me@x.com"}, Body: "hello body"},
 	}
-	m := newWithSession(sess, "example.com", false, config.Default())
+	m := NewWithSession(sess, "example.com", false, config.Default())
 	m.width, m.height = 80, 24
 	m.loggedInUser = "me@x.com"
 	m.emails = sess.summaries
@@ -68,7 +68,7 @@ func TestInboxFooterPinnedToBottom(t *testing.T) {
 			{UID: 1, From: "a@x.com", Subject: "hi", Seen: false},
 		},
 	}
-	m := newWithSession(sess, "example.com", false, config.Default())
+	m := NewWithSession(sess, "example.com", false, config.Default())
 	m.width, m.height = 80, 24
 	m.loggedInUser = "me@x.com"
 	m.emails = sess.summaries
@@ -104,7 +104,7 @@ func TestScrollWithManyEmails(t *testing.T) {
 			Seen:    true,
 		})
 	}
-	m := newWithSession(&fakeSession{summaries: summaries}, "example.com", false, config.Default())
+	m := NewWithSession(&fakeSession{summaries: summaries}, "example.com", false, config.Default())
 	m.width, m.height = 80, 24
 	m.loggedInUser = "me@x.com"
 	m.emails = summaries
@@ -135,7 +135,7 @@ func TestScrollWithManyEmails(t *testing.T) {
 }
 
 func TestDraftsListAndResume(t *testing.T) {
-	m := newWithSession(&fakeSession{}, "example.com", false, config.Default())
+	m := NewWithSession(&fakeSession{}, "example.com", false, config.Default())
 	m.width, m.height = 80, 24
 	m.loggedInUser = "me@x.com"
 	m.state = inboxView
@@ -178,7 +178,7 @@ func TestDraftsListAndResume(t *testing.T) {
 }
 
 func TestDraftSaveAppendsToList(t *testing.T) {
-	m := newWithSession(&fakeSession{}, "example.com", false, config.Default())
+	m := NewWithSession(&fakeSession{}, "example.com", false, config.Default())
 	m.width, m.height = 80, 24
 	m.state = draftConfirmView
 	m.composeTo.SetValue("charlie@x.com")
@@ -200,7 +200,7 @@ func TestDraftSaveAppendsToList(t *testing.T) {
 }
 
 func TestDraftDeleteFromList(t *testing.T) {
-	m := newWithSession(&fakeSession{}, "example.com", false, config.Default())
+	m := NewWithSession(&fakeSession{}, "example.com", false, config.Default())
 	m.width, m.height = 80, 24
 	m.state = draftsView
 	m.drafts = []draftData{
@@ -220,7 +220,7 @@ func TestDraftDeleteFromList(t *testing.T) {
 }
 
 func TestInboxStatusShowsDraftCount(t *testing.T) {
-	m := newWithSession(&fakeSession{}, "example.com", false, config.Default())
+	m := NewWithSession(&fakeSession{}, "example.com", false, config.Default())
 	m.width, m.height = 80, 24
 	m.loggedInUser = "me@x.com"
 	m.state = inboxView

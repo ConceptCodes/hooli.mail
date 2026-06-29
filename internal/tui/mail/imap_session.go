@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"log"
 	"net"
 	"net/smtp"
 	"strings"
@@ -31,14 +32,30 @@ func NewIMAPSession(server string, insecure bool) *IMAPSession {
 	return &IMAPSession{server: server, insecure: insecure, submissionPort: "587"}
 }
 
+// withTimeout returns a context bounded by the given timeout, cancelled when
+// the caller's ctx is cancelled. The default timeout protects the TUI from
+// hanging forever on an unresponsive server even when the caller passes a
+// non-cancellable context (e.g. context.Background()).
+func withTimeout(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {
+	if deadline, ok := ctx.Deadline(); ok {
+		// Caller already set a deadline; keep the earlier of the two.
+		if time.Until(deadline) < d {
+			return context.WithCancel(ctx)
+		}
+	}
+	return context.WithTimeout(ctx, d)
+}
+
 func (s *IMAPSession) Login(ctx context.Context, username, password string) ([]Summary, error) {
-	c, err := s.dialIMAP()
+	c, err := s.dialIMAP(ctx)
 	if err != nil {
 		return nil, err
 	}
 
 	if err := c.Login(username, password); err != nil {
-		c.Logout()
+		// Best-effort teardown on a failed login; the connection is unusable
+		// either way and we don't want to leak it.
+		_ = c.Logout()
 		return nil, fmt.Errorf("invalid credentials: %w", err)
 	}
 
@@ -46,17 +63,17 @@ func (s *IMAPSession) Login(ctx context.Context, username, password string) ([]S
 	s.username = username
 	s.submissionAuth = smtp.PlainAuth("", username, password, s.server)
 
-	return s.loadInbox()
+	return s.loadInbox(ctx)
 }
 
 func (s *IMAPSession) Refresh(ctx context.Context) ([]Summary, error) {
 	if s.client == nil {
 		return nil, fmt.Errorf("not connected")
 	}
-	return s.loadInbox()
+	return s.loadInbox(ctx)
 }
 
-func (s *IMAPSession) loadInbox() ([]Summary, error) {
+func (s *IMAPSession) loadInbox(ctx context.Context) ([]Summary, error) {
 	mbox, err := s.client.Select("INBOX", false)
 	if err != nil {
 		return nil, fmt.Errorf("cannot open inbox: %w", err)
@@ -80,6 +97,9 @@ func (s *IMAPSession) loadInbox() ([]Summary, error) {
 	}
 	if err := <-done; err != nil {
 		return nil, fmt.Errorf("cannot load inbox: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	return summaries, nil
 }
@@ -134,7 +154,15 @@ func (s *IMAPSession) Fetch(ctx context.Context, uid uint32) (*Full, error) {
 
 	storeSet := new(imap.SeqSet)
 	storeSet.AddNum(uid)
-	s.client.UidStore(storeSet, imap.FormatFlagsOp(imap.AddFlags, false), []interface{}{imap.SeenFlag}, nil)
+	if err := s.client.UidStore(storeSet, imap.FormatFlagsOp(imap.AddFlags, false), []interface{}{imap.SeenFlag}, nil); err != nil {
+		// Non-fatal: we still show the message, but log the cause so the
+		// \Seen update isn't silently dropped.
+		log.Printf("imap: marking %d \\Seen: %v", uid, err)
+	}
+
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	return &Full{
 		From:    from,
@@ -158,31 +186,72 @@ func (s *IMAPSession) Send(ctx context.Context, out Outgoing) error {
 		s.sender(), to, out.Subject, out.Body)
 
 	addr := net.JoinHostPort(s.server, s.submissionPort)
-	if err := smtp.SendMail(addr, s.submissionAuth, s.sender(), strings.Split(to, ","), []byte(msg)); err != nil {
-		return fmt.Errorf("send failed: %w", err)
+	done := make(chan error, 1)
+	go func() {
+		done <- smtp.SendMail(addr, s.submissionAuth, s.sender(), strings.Split(to, ","), []byte(msg))
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			return fmt.Errorf("send failed: %w", err)
+		}
+		return ctx.Err()
+	case <-ctx.Done():
+		return ctx.Err()
 	}
-	return nil
 }
 
 func (s *IMAPSession) Logout(ctx context.Context) error {
 	if s.client == nil {
 		return nil
 	}
-	err := s.client.Logout()
-	s.client = nil
-	return err
+	done := make(chan error, 1)
+	go func() { done <- s.client.Logout() }()
+	select {
+	case err := <-done:
+		s.client = nil
+		return err
+	case <-time.After(5 * time.Second):
+		// Server didn't reply to LOGOUT — drop the connection so the TUI
+		// never hangs on quit. The client is unusable either way.
+		s.client = nil
+		return nil
+	case <-ctx.Done():
+		s.client = nil
+		return ctx.Err()
+	}
 }
 
 func (s *IMAPSession) sender() string {
 	return s.username
 }
 
+// ctxDialer adapts a *net.Dialer + context to the imapclient.Dialer
+// interface, so dial cancellation honours ctx.Done() rather than just a
+// static Timeout.
+type ctxDialer struct {
+	ctx context.Context
+	d   *net.Dialer
+}
+
+func (c ctxDialer) Dial(network, addr string) (net.Conn, error) {
+	return c.d.DialContext(c.ctx, network, addr)
+}
+
 // dialIMAP tries IMAPS (993), then IMAP (143) + STARTTLS, then (when insecure)
 // plain IMAP. When insecure is false, the server certificate is verified
 // against the configured ServerName — no InsecureSkipVerify shortcut.
-func (s *IMAPSession) dialIMAP() (*imapclient.Client, error) {
+//
+// The dial itself is bounded by ctx; if the caller's context has no deadline
+// we apply a 30s default so an unreachable host can never wedge the TUI.
+func (s *IMAPSession) dialIMAP(ctx context.Context) (*imapclient.Client, error) {
+	dialCtx, cancel := withTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	d := ctxDialer{ctx: dialCtx, d: &net.Dialer{}}
+
 	if s.insecure {
-		c, err := imapclient.Dial(net.JoinHostPort(s.server, "143"))
+		c, err := imapclient.DialWithDialer(d, net.JoinHostPort(s.server, "143"))
 		if err != nil {
 			return nil, fmt.Errorf("cannot reach %s:143: %w", s.server, err)
 		}
@@ -193,16 +262,20 @@ func (s *IMAPSession) dialIMAP() (*imapclient.Client, error) {
 		ServerName: s.server,
 	}
 
-	if c, err := imapclient.DialTLS(net.JoinHostPort(s.server, "993"), tlsCfg); err == nil {
+	if c, err := imapclient.DialWithDialerTLS(d, net.JoinHostPort(s.server, "993"), tlsCfg); err == nil {
 		return c, nil
+	} else if ctxErr := dialCtx.Err(); ctxErr != nil {
+		return nil, fmt.Errorf("cannot connect to %s:993: %w", s.server, ctxErr)
 	}
 
-	c, err := imapclient.Dial(net.JoinHostPort(s.server, "143"))
+	c, err := imapclient.DialWithDialer(d, net.JoinHostPort(s.server, "143"))
 	if err == nil {
 		if err := c.StartTLS(tlsCfg); err == nil {
 			return c, nil
 		}
-		c.Logout()
+		// STARTTLS failed on the plain-text connection — drop it before we
+		// fall through to the overall error.
+		_ = c.Logout()
 	}
 
 	return nil, fmt.Errorf("cannot connect to %s (IMAP 993/143)", s.server)
@@ -247,13 +320,19 @@ func extractBody(msg *imap.Message) string {
 	for sectionName, literal := range msg.Body {
 		if sectionName.Specifier == imap.TextSpecifier || sectionName.Specifier == imap.EntireSpecifier {
 			buf := new(bytes.Buffer)
-			buf.ReadFrom(literal)
+			if _, err := buf.ReadFrom(literal); err != nil {
+				log.Printf("imap: extracting body section: %v", err)
+				continue
+			}
 			return buf.String()
 		}
 	}
 	for _, literal := range msg.Body {
 		buf := new(bytes.Buffer)
-		buf.ReadFrom(literal)
+		if _, err := buf.ReadFrom(literal); err != nil {
+			log.Printf("imap: extracting body fallback: %v", err)
+			continue
+		}
 		return buf.String()
 	}
 	return ""

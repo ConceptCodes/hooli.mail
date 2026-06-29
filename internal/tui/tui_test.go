@@ -30,7 +30,7 @@ func (f *fakeSession) Logout(context.Context) error                      { retur
 
 func newTestModel(t *testing.T, sess mail.Session) *model {
 	t.Helper()
-	m := newWithSession(sess, "example.com", false, config.Default())
+	m := NewWithSession(sess, "example.com", false, config.Default())
 	m.width, m.height = 80, 24
 	return m
 }
