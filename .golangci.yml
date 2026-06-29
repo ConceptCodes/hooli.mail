@@ -1,0 +1,113 @@
+# golangci-lint configuration for Hooli Mail (v2 format).
+#
+# Linters here are intentionally conservative — each must earn its place by
+# catching real bugs without producing churn. Coverage-oriented linters and
+# opinionated style guides (e.g. wsl, gofumpt, lll) are deliberately excluded
+# so `golangci-lint run` is fast enough to gate CI without noisy reformatting
+# diffs.
+#
+# Run locally with:    just lint
+# CI runs this via:    just ci
+
+version: "2"
+
+run:
+  timeout: 5m
+  modules-download-mode: readonly
+
+linters:
+  # Enable only the linters explicitly listed below — a la carte, not the
+  # default set. New linters have to earn a place by catching real bugs.
+  default: none
+  enable:
+    - errcheck        # unchecked errors
+    - govet           # `go vet` suite
+    - ineffassign     # ineffectual assignments
+    - staticcheck     # static analysis (subsumes gosimple in v2)
+    - unused          # unused code
+    - bodyclose       # response bodies must be closed
+    - contextcheck    # context.Background where the caller's ctx should flow
+    - errorlint       # %w vs %s, sentinel error comparison
+    - nilerr          # returning nil on a non-nil error
+    - rowserrcheck    # sql.Rows.Err() — directly relevant to this codebase
+    - sqlclosecheck   # rows.Close()
+    - durationcheck   # time.Duration*literal multiplication traps
+    - copyloopvar     # loop variable capture (Go 1.22+ semantics)
+    - gocritic        # curated extra set
+    - misspell        # spelling in comments/strings
+    - revive          # golint successor, configurable
+
+  settings:
+    errcheck:
+      check-type-assertions: false
+      check-blank: false
+    errorlint:
+      errorf: true
+      asserts: true
+      comparison: true
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - performance
+      disabled-checks:
+        - hugeParam        # pass-by-value recommendations are noisy on small DTOs
+        - rangeValCopy     # intentional for our returned copies
+        - ifElseChain      # opinionated branch reshuffling
+        - evalOrder        # stylistic — Bubble Tea return-and-call is idiomatic
+        - exitAfterDefer   # noisy on cmd/* entry points that use log.Fatalf
+    revive:
+      severity: warning
+      rules:
+        - name: blank-imports
+        - name: context-as-argument
+        - name: context-keys-type
+        - name: dot-imports
+        - name: error-naming
+        - name: error-strings
+        - name: error-return
+        - name: errorf
+        # "exported" (doc-comment-or-unexported) intentionally disabled: the
+        # codebase has many small DTOs whose doc-comment cost outweighs value.
+        - name: increment-decrement
+        - name: indent-error-flow
+        - name: range
+        - name: receiver-naming
+        - name: time-naming
+        - name: unexported-return
+        - name: unreachable-code
+        # "unused-parameter" intentionally disabled: noisy on interface
+        # implementations (SMTP/IMAP backends) where the parameter exists to
+        # satisfy a library signature. Renaming to `_` hurts readability.
+        - name: var-declaration
+        - name: var-naming
+
+  exclusions:
+    presets:
+      - common-false-positives
+    rules:
+      # Test files commonly make intentional simplifications (unused params,
+      # error ignoring for setup, direct type assertions on errors that aren't
+      # wrapped yet in test code paths). Keep lint out of test files to focus
+      # CI on production code.
+      - path: _test\.go
+        linters:
+          - errcheck
+          - revive
+          - gocritic
+          - errorlint
+          - copyloopvar
+      # cmd/* entry points legitimately call log.Fatalf on hard failures.
+      - path: cmd/
+        linters:
+          - revive
+          - gocritic
+        text: "(log-fatal|exitAfterDefer)"
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
+output:
+  formats:
+    text:
+      path: stdout
