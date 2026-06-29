@@ -3,10 +3,11 @@ package imap
 import (
 	"context"
 	"sort"
+	"strings"
 	"testing"
-	"time"
 
 	"hooli.mail/server/internal/mailstore"
+	"hooli.mail/server/internal/message"
 	"hooli.mail/server/internal/models"
 	"hooli.mail/server/internal/storage/memory"
 
@@ -14,7 +15,7 @@ import (
 )
 
 // flagsEqual sorts then compares two flag slices so tests are order-
-// insensitive — applyFlagsOp returns from a map iteration.
+// insensitive — the mailbox.ApplyFlags result comes from a map iteration.
 func flagsEqual(got []string, want ...string) bool {
 	if len(got) != len(want) {
 		return false
@@ -29,107 +30,6 @@ func flagsEqual(got []string, want ...string) bool {
 		}
 	}
 	return true
-}
-
-// TestApplyFlagsOpSetAll previously pinned the bug where SetFlags reset the
-// flag set inside the loop and only the final flag survived. With multiple
-// flags passed to STORE FLAGS, all must be present in the result.
-func TestApplyFlagsOpSetAll(t *testing.T) {
-	t.Parallel()
-	current := []string{models.FlagSeen, models.FlagRecent}
-	got := applyFlagsOp(current, imap.SetFlags, []string{models.FlagSeen, models.FlagFlagged})
-	if !flagsEqual(got, models.FlagSeen, models.FlagFlagged) {
-		t.Errorf("SetFlags = %v, want [\\Seen \\Flagged] (current must be replaced, not collapsed)", got)
-	}
-}
-
-func TestApplyFlagsOpAddPreservesExisting(t *testing.T) {
-	t.Parallel()
-	current := []string{models.FlagSeen}
-	got := applyFlagsOp(current, imap.AddFlags, []string{models.FlagFlagged, models.FlagAnswered})
-	if !flagsEqual(got, models.FlagSeen, models.FlagFlagged, models.FlagAnswered) {
-		t.Errorf("AddFlags = %v, want [\\Seen \\Flagged \\Answered]", got)
-	}
-}
-
-func TestApplyFlagsOpRemove(t *testing.T) {
-	t.Parallel()
-	current := []string{models.FlagSeen, models.FlagFlagged, models.FlagRecent}
-	got := applyFlagsOp(current, imap.RemoveFlags, []string{models.FlagSeen, models.FlagRecent})
-	if !flagsEqual(got, models.FlagFlagged) {
-		t.Errorf("RemoveFlags = %v, want [\\Flagged]", got)
-	}
-}
-
-func TestApplyFlagsOpSetEmptyClearsAll(t *testing.T) {
-	t.Parallel()
-	current := []string{models.FlagSeen, models.FlagFlagged}
-	got := applyFlagsOp(current, imap.SetFlags, nil)
-	if len(got) != 0 {
-		t.Errorf("SetFlags empty = %v, want []", got)
-	}
-}
-
-// --- Search criteria helpers ---
-
-func TestMatchFlags(t *testing.T) {
-	t.Parallel()
-	flags := []string{models.FlagSeen, models.FlagFlagged}
-	if !matchFlags(flags, []string{models.FlagSeen}, nil) {
-		t.Error("expected match when WithFlags=[Seen] and Seen is present")
-	}
-	if matchFlags(flags, []string{models.FlagSeen, models.FlagDeleted}, nil) {
-		t.Error("expected no match when WithFlags contains absent Deleted")
-	}
-	if matchFlags(flags, nil, []string{models.FlagSeen}) {
-		t.Error("expected no match when WithoutFlags=[Seen] and Seen is present")
-	}
-	if !matchFlags(flags, nil, []string{models.FlagDeleted}) {
-		t.Error("expected match when WithoutFlags=[Deleted] and Deleted is absent")
-	}
-}
-
-func TestMatchFlagsCaseInsensitive(t *testing.T) {
-	t.Parallel()
-	flags := []string{"\\Seen"}
-	if !matchFlags(flags, []string{"\\SEEN"}, nil) {
-		t.Error("flag matching must be case-insensitive")
-	}
-}
-
-func TestMatchDateRange(t *testing.T) {
-	t.Parallel()
-	mid := time.Date(2024, 6, 15, 12, 0, 0, 0, time.UTC)
-	since := time.Date(2024, 6, 1, 0, 0, 0, 0, time.UTC)
-	before := time.Date(2024, 7, 1, 0, 0, 0, 0, time.UTC)
-	if !matchDateRange(mid, since, time.Time{}) {
-		t.Error("expected match: mid is after Since")
-	}
-	if matchDateRange(since.Add(-24*time.Hour), since, time.Time{}) {
-		t.Error("expected no match: date is before Since")
-	}
-	if !matchDateRange(mid, time.Time{}, before) {
-		t.Error("expected match: mid is before Before")
-	}
-	if matchDateRange(before, time.Time{}, before) {
-		t.Error("expected no match: date equals Before (Before is exclusive)")
-	}
-}
-
-func TestMatchSize(t *testing.T) {
-	t.Parallel()
-	if matchSize(100, 100, 0) {
-		t.Error("Larger is exclusive: 100 not larger than 100")
-	}
-	if !matchSize(101, 100, 0) {
-		t.Error("expected match: 101 > 100")
-	}
-	if matchSize(100, 0, 100) {
-		t.Error("Smaller is exclusive: 100 not smaller than 100")
-	}
-	if !matchSize(99, 0, 100) {
-		t.Error("expected match: 99 < 100")
-	}
 }
 
 // --- IMAP adapter end-to-end against the in-memory store ---
@@ -155,6 +55,17 @@ func inboxOf(t *testing.T, b *IMAPBackend, u *models.User) *models.Mailbox {
 	return mb
 }
 
+// rawMessage builds RFC 5322 bytes from simple fields for test construction.
+func rawMessage(from string, to []string, subject, body string) []byte {
+	return []byte(strings.Join([]string{
+		"From: " + from,
+		"To: " + strings.Join(to, ", "),
+		"Subject: " + subject,
+		"",
+		body,
+	}, "\r\n"))
+}
+
 // TestIMAPUpdateMessagesFlagsSetAll drives the full STORE FLAGS path through
 // the adapter — the same path that was silently broken before the postgres
 // %w-nil fix and the applyFlagsOp fix. Uses the memory store so no Postgres is
@@ -166,8 +77,7 @@ func TestIMAPUpdateMessagesFlagsSetAll(t *testing.T) {
 	mb := inboxOf(t, b, u)
 
 	email, err := b.store.Append(context.Background(), mb.ID, mailstore.Message{
-		From: "boss@hooli.test", To: []string{"alice@hooli.test"},
-		Subject: "promo", Body: "you got it",
+		Parsed: message.Parse(rawMessage("boss@hooli.test", []string{"alice@hooli.test"}, "promo", "you got it")),
 	})
 	if err != nil {
 		t.Fatalf("append: %v", err)
@@ -203,13 +113,13 @@ func TestIMAPSearchByFlags(t *testing.T) {
 	mb := inboxOf(t, b, u)
 
 	if _, err := b.store.Append(context.Background(), mb.ID, mailstore.Message{
-		From: "a@h", To: []string{"alice@hooli.test"}, Subject: "1", Body: "1",
+		Parsed: message.Parse(rawMessage("a@h", []string{"alice@hooli.test"}, "1", "1")),
 	}); err != nil {
 		t.Fatalf("append 1: %v", err)
 	}
 	seen, err := b.store.Append(context.Background(), mb.ID, mailstore.Message{
-		From: "b@h", To: []string{"alice@hooli.test"}, Subject: "2", Body: "2",
-		Flags: []string{models.FlagSeen},
+		Parsed: message.Parse(rawMessage("b@h", []string{"alice@hooli.test"}, "2", "2")),
+		Flags:  []string{models.FlagSeen},
 	})
 	if err != nil {
 		t.Fatalf("append 2: %v", err)
@@ -248,14 +158,12 @@ func TestIMAPSearchByText(t *testing.T) {
 	mb := inboxOf(t, b, u)
 
 	if _, err := b.store.Append(context.Background(), mb.ID, mailstore.Message{
-		From: "alice-mentor@external.com", To: []string{"alice@hooli.test"},
-		Subject: "Quarterly review", Body: "schedule for Q3",
+		Parsed: message.Parse(rawMessage("alice-mentor@external.com", []string{"alice@hooli.test"}, "Quarterly review", "schedule for Q3")),
 	}); err != nil {
 		t.Fatalf("append 1: %v", err)
 	}
 	if _, err := b.store.Append(context.Background(), mb.ID, mailstore.Message{
-		From: "noreply@spam.com", To: []string{"alice@hooli.test"},
-		Subject: "WINNER", Body: "click here",
+		Parsed: message.Parse(rawMessage("noreply@spam.com", []string{"alice@hooli.test"}, "WINNER", "click here")),
 	}); err != nil {
 		t.Fatalf("append 2: %v", err)
 	}
@@ -269,5 +177,64 @@ func TestIMAPSearchByText(t *testing.T) {
 	}
 	if len(ids) != 1 {
 		t.Errorf("Text quarterly matched %d, want 1", len(ids))
+	}
+}
+
+// TestBuildEnvelopePreservesDisplayNamesAndMetadata pins the fix for the
+// inaccurate envelope reconstruction. The old buildEnvelope naively split
+// addresses on "@" and set PersonalName = mailbox part, losing display names
+// and all of Cc/Message-ID/In-Reply-To.
+func TestBuildEnvelopePreservesDisplayNamesAndMetadata(t *testing.T) {
+	t.Parallel()
+	b, u := newAuthedBackend(t)
+	mb := inboxOf(t, b, u)
+
+	raw := []byte(strings.Join([]string{
+		"From: Alice <alice@example.com>",
+		"To: bob@example.com, Carol <carol@example.com>",
+		"Cc: dave@example.com",
+		"Subject: Envelope test",
+		"Message-ID: <env-123@example.com>",
+		"In-Reply-To: <parent@example.com>",
+		"",
+		"body",
+	}, "\r\n"))
+
+	email, err := b.store.Append(context.Background(), mb.ID, mailstore.Message{
+		Parsed: message.Parse(raw),
+	})
+	if err != nil {
+		t.Fatalf("append: %v", err)
+	}
+
+	box := &IMAPMailbox{backend: b, mailbox: mb, user: &IMAPUser{backend: b, user: u, ctx: context.Background()}}
+	env := box.buildEnvelope(*email)
+
+	if env.Subject != "Envelope test" {
+		t.Errorf("Subject = %q", env.Subject)
+	}
+	if len(env.From) != 1 {
+		t.Fatalf("From has %d addresses, want 1", len(env.From))
+	}
+	if env.From[0].PersonalName != "Alice" {
+		t.Errorf("From PersonalName = %q, want 'Alice'", env.From[0].PersonalName)
+	}
+	if env.From[0].MailboxName != "alice" || env.From[0].HostName != "example.com" {
+		t.Errorf("From = %s@%s, want alice@example.com", env.From[0].MailboxName, env.From[0].HostName)
+	}
+	if len(env.To) != 2 {
+		t.Fatalf("To has %d addresses, want 2", len(env.To))
+	}
+	if env.To[1].PersonalName != "Carol" {
+		t.Errorf("To[1] PersonalName = %q, want 'Carol'", env.To[1].PersonalName)
+	}
+	if len(env.Cc) != 1 || env.Cc[0].MailboxName != "dave" {
+		t.Errorf("Cc = %v, want dave@example.com", env.Cc)
+	}
+	if env.MessageId != "<env-123@example.com>" {
+		t.Errorf("MessageId = %q", env.MessageId)
+	}
+	if env.InReplyTo != "<parent@example.com>" {
+		t.Errorf("InReplyTo = %q", env.InReplyTo)
 	}
 }
