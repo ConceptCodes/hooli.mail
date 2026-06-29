@@ -47,8 +47,8 @@ func TestStatusDerivesCountsFromFlags(t *testing.T) {
 	u := newTestUser(t, s)
 	mb := inboxOf(t, s, u.ID)
 
-	appendMsg(t, s, mb.ID, nil)                                   // recent + unseen (default \Recent, no \Seen)
-	appendMsg(t, s, mb.ID, []string{models.FlagSeen})            // seen
+	appendMsg(t, s, mb.ID, nil)                                          // recent + unseen (default \Recent, no \Seen)
+	appendMsg(t, s, mb.ID, []string{models.FlagSeen})                    // seen
 	appendMsg(t, s, mb.ID, []string{models.FlagRecent, models.FlagSeen}) // recent but seen
 
 	st, err := s.Status(context.Background(), mb.ID)

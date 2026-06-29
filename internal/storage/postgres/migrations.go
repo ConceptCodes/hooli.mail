@@ -46,11 +46,11 @@ var migrations = []struct {
 	},
 	{
 		name: "004_create_email_indexes",
-		sql: `CREATE INDEX IF NOT EXISTS idx_emails_mailbox_id ON emails(mailbox_id)`,
+		sql:  `CREATE INDEX IF NOT EXISTS idx_emails_mailbox_id ON emails(mailbox_id)`,
 	},
 	{
 		name: "005_create_mailbox_indexes",
-		sql: `CREATE INDEX IF NOT EXISTS idx_mailboxes_user_id ON mailboxes(user_id)`,
+		sql:  `CREATE INDEX IF NOT EXISTS idx_mailboxes_user_id ON mailboxes(user_id)`,
 	},
 }
 

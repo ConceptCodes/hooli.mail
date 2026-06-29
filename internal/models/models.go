@@ -10,9 +10,9 @@ type User struct {
 }
 
 type Mailbox struct {
-	ID      int64     `json:"id"`
-	UserID  int64     `json:"user_id"`
-	Name    string    `json:"name"`
+	ID        int64     `json:"id"`
+	UserID    int64     `json:"user_id"`
+	Name      string    `json:"name"`
 	CreatedAt time.Time `json:"created_at"`
 }
 
@@ -30,11 +30,11 @@ type Email struct {
 }
 
 const (
-	FlagRecent  = "\\Recent"
-	FlagSeen    = "\\Seen"
-	FlagDeleted = "\\Deleted"
-	FlagFlagged = "\\Flagged"
-	FlagDraft   = "\\Draft"
+	FlagRecent   = "\\Recent"
+	FlagSeen     = "\\Seen"
+	FlagDeleted  = "\\Deleted"
+	FlagFlagged  = "\\Flagged"
+	FlagDraft    = "\\Draft"
 	FlagAnswered = "\\Answered"
 )
 

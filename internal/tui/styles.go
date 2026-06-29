@@ -44,10 +44,10 @@ type Styles struct {
 }
 
 func NewStyles(cfg config.Config) Styles {
-	ink    := lipgloss.AdaptiveColor{Light: cfg.Theme.Light.Ink,   Dark: cfg.Theme.Dark.Ink}
-	dim    := lipgloss.AdaptiveColor{Light: cfg.Theme.Light.Dim,   Dark: cfg.Theme.Dark.Dim}
-	faint  := lipgloss.AdaptiveColor{Light: cfg.Theme.Light.Faint, Dark: cfg.Theme.Dark.Faint}
-	seal   := lipgloss.AdaptiveColor{Light: cfg.Theme.Light.Seal,  Dark: cfg.Theme.Dark.Seal}
+	ink := lipgloss.AdaptiveColor{Light: cfg.Theme.Light.Ink, Dark: cfg.Theme.Dark.Ink}
+	dim := lipgloss.AdaptiveColor{Light: cfg.Theme.Light.Dim, Dark: cfg.Theme.Dark.Dim}
+	faint := lipgloss.AdaptiveColor{Light: cfg.Theme.Light.Faint, Dark: cfg.Theme.Dark.Faint}
+	seal := lipgloss.AdaptiveColor{Light: cfg.Theme.Light.Seal, Dark: cfg.Theme.Dark.Seal}
 	errClr := lipgloss.AdaptiveColor{Light: cfg.Theme.Light.Error, Dark: cfg.Theme.Dark.Error}
 
 	return Styles{

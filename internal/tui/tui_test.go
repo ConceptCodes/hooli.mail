@@ -26,7 +26,7 @@ func (f *fakeSession) Refresh(context.Context) ([]mail.Summary, error) {
 }
 func (f *fakeSession) Fetch(context.Context, uint32) (*mail.Full, error) { return f.full, nil }
 func (f *fakeSession) Send(_ context.Context, out mail.Outgoing) error   { f.sent = &out; return nil }
-func (f *fakeSession) Logout(context.Context) error                     { return nil }
+func (f *fakeSession) Logout(context.Context) error                      { return nil }
 
 func newTestModel(t *testing.T, sess mail.Session) *model {
 	t.Helper()
