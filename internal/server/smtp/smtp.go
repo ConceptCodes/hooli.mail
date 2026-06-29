@@ -9,13 +9,13 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/mail"
 	"strings"
 
 	"hooli.mail/server/internal/auth"
 	"hooli.mail/server/internal/delivery"
+	"hooli.mail/server/internal/logger"
 	"hooli.mail/server/internal/mailstore"
 	"hooli.mail/server/internal/models"
 
@@ -121,7 +121,7 @@ func (s *Session) Data(r io.Reader) error {
 	delivered := 0
 	for _, r := range results {
 		if r.Err != nil {
-			log.Printf("deliver to %s: %v", r.Recipient, r.Err)
+			logger.Warn("delivery failed for recipient", "recipient", r.Recipient, "error", r.Err)
 			lastErr = r.Err
 			continue
 		}
@@ -185,7 +185,7 @@ func (s *Server) Start() error {
 	if err != nil {
 		return fmt.Errorf("listen smtp: %w", err)
 	}
-	log.Printf("SMTP server listening on %s (TLS: %v)", s.srv.Addr, s.srv.TLSConfig != nil)
+	logger.Info("SMTP server listening", "addr", s.srv.Addr, "tls", s.srv.TLSConfig != nil)
 	return s.srv.Serve(ln)
 }
 

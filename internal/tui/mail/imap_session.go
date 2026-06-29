@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
-	"log"
 	"net"
 	"net/smtp"
 	"strings"
@@ -13,6 +12,8 @@ import (
 
 	imap "github.com/emersion/go-imap"
 	imapclient "github.com/emersion/go-imap/client"
+
+	"hooli.mail/server/internal/logger"
 )
 
 // IMAPSession is the real client adapter: IMAP (143 STARTTLS / 993 TLS) for
@@ -157,7 +158,7 @@ func (s *IMAPSession) Fetch(ctx context.Context, uid uint32) (*Full, error) {
 	if err := s.client.UidStore(storeSet, imap.FormatFlagsOp(imap.AddFlags, false), []interface{}{imap.SeenFlag}, nil); err != nil {
 		// Non-fatal: we still show the message, but log the cause so the
 		// \Seen update isn't silently dropped.
-		log.Printf("imap: marking %d \\Seen: %v", uid, err)
+		logger.Warn("failed to mark message seen", "uid", uid, "error", err)
 	}
 
 	if err := ctx.Err(); err != nil {
@@ -352,7 +353,7 @@ func extractBody(msg *imap.Message) string {
 		if sectionName.Specifier == imap.TextSpecifier || sectionName.Specifier == imap.EntireSpecifier {
 			buf := new(bytes.Buffer)
 			if _, err := buf.ReadFrom(literal); err != nil {
-				log.Printf("imap: extracting body section: %v", err)
+				logger.Warn("failed to extract body section", "error", err)
 				continue
 			}
 			return buf.String()
@@ -361,7 +362,7 @@ func extractBody(msg *imap.Message) string {
 	for _, literal := range msg.Body {
 		buf := new(bytes.Buffer)
 		if _, err := buf.ReadFrom(literal); err != nil {
-			log.Printf("imap: extracting body fallback: %v", err)
+			logger.Warn("failed to extract body (fallback)", "error", err)
 			continue
 		}
 		return buf.String()

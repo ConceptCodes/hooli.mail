@@ -3,15 +3,17 @@ package main
 import (
 	"context"
 	"flag"
-	"log"
 	"os"
 	"os/signal"
 	"syscall"
 
+	"hooli.mail/server/internal/logger"
 	"hooli.mail/server/internal/runtime"
 )
 
 func main() {
+	logger.Init(logger.LevelInfo)
+
 	cfg := parseFlags()
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -19,7 +21,8 @@ func main() {
 
 	rt := runtime.New(cfg)
 	if err := rt.Init(ctx); err != nil {
-		log.Fatalf("init: %v", err)
+		logger.Error("init failed", "error", err)
+		os.Exit(1)
 	}
 	defer rt.Close()
 

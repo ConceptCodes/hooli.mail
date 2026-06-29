@@ -4,11 +4,11 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"log"
 	"os"
 	"time"
 
 	"hooli.mail/server/internal/config"
+	"hooli.mail/server/internal/logger"
 	"hooli.mail/server/internal/tui"
 	"hooli.mail/server/internal/tui/mail"
 
@@ -18,7 +18,8 @@ import (
 func main() {
 	cfg, err := config.Ensure()
 	if err != nil {
-		log.Fatalf("Config error: %v", err)
+		logger.Error("config error", "error", err)
+		os.Exit(1)
 	}
 
 	defaultServer := cfg.Server
@@ -38,7 +39,8 @@ func main() {
 
 	p := tea.NewProgram(m, tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
-		log.Fatalf("TUI error: %v", err)
+		logger.Error("TUI error", "error", err)
+		os.Exit(1)
 	}
 
 	// Best-effort logout with a short cap so a wedged server can't hang the

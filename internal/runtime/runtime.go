@@ -12,7 +12,6 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
-	"log"
 	"net"
 	"net/http"
 	"sync"
@@ -21,6 +20,7 @@ import (
 	"golang.org/x/crypto/acme/autocert"
 
 	"hooli.mail/server/internal/auth"
+	"hooli.mail/server/internal/logger"
 	"hooli.mail/server/internal/server/imap"
 	"hooli.mail/server/internal/server/smtp"
 	"hooli.mail/server/internal/storage/postgres"
@@ -87,7 +87,7 @@ func (r *Runtime) seed(ctx context.Context) error {
 		return fmt.Errorf("check user: %w", err)
 	}
 	if existing != nil {
-		log.Printf("User %s already exists, skipping seed", r.cfg.SeedEmail)
+		logger.Info("user already exists, skipping seed", "email", r.cfg.SeedEmail)
 		return nil
 	}
 	hash, err := auth.HashPassword(r.cfg.SeedPass)
@@ -98,17 +98,17 @@ func (r *Runtime) seed(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("create user: %w", err)
 	}
-	log.Printf("Seeded user %s (id=%d)", user.Email, user.ID)
+	logger.Info("seeded user", "email", user.Email, "id", user.ID)
 	return nil
 }
 
 func (r *Runtime) provisionTLS() {
 	if r.cfg.Domain == "" {
-		log.Println("No domain set — running without TLS (dev mode)")
+		logger.Info("no domain set, running without TLS", "mode", "dev")
 		return
 	}
 
-	log.Printf("Domain: %s — provisioning Let's Encrypt certificates", r.cfg.Domain)
+	logger.Info("provisioning Let's Encrypt certificates", "domain", r.cfg.Domain)
 	r.acmeMgr = &autocert.Manager{
 		Cache:  autocert.DirCache("certs"),
 		Prompt: autocert.AcceptTOS,
@@ -161,9 +161,9 @@ func (r *Runtime) Run(ctx context.Context) error {
 	var fatalErr error
 	select {
 	case <-ctx.Done():
-		log.Println("Shutting down...")
+		logger.Info("shutting down", "reason", "signal")
 	case err := <-errCh:
-		log.Printf("Fatal: %v", err)
+		logger.Error("fatal server error", "error", err)
 		fatalErr = err
 	}
 
@@ -180,7 +180,7 @@ func (r *Runtime) Run(ctx context.Context) error {
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
-		log.Println("Shutdown: some goroutines did not exit within 5s")
+		logger.Warn("shutdown timeout, some goroutines did not exit", "timeout", "5s")
 	}
 
 	return fatalErr
@@ -195,7 +195,7 @@ func (r *Runtime) createServers(ctx context.Context) {
 
 func (r *Runtime) runServer(name string, fn func() error, wg *sync.WaitGroup, errCh chan<- error) {
 	defer wg.Done()
-	log.Printf("Starting %s...", name)
+	logger.Info("starting server", "name", name)
 	if err := fn(); err != nil {
 		if errors.Is(err, net.ErrClosed) {
 			return
@@ -208,11 +208,11 @@ func (r *Runtime) startACMEHTTP(wg *sync.WaitGroup, errCh chan<- error) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		log.Println("Starting ACME HTTP challenge server on :80")
+		logger.Info("starting ACME HTTP challenge server", "addr", ":80")
 		acmeSrv := &http.Server{
 			Addr:     ":80",
 			Handler:  r.acmeMgr.HTTPHandler(nil),
-			ErrorLog: log.Default(),
+			ErrorLog: logger.Bridge(),
 		}
 		r.acmeHTTP = acmeSrv
 		if err := acmeSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
@@ -229,7 +229,7 @@ func (r *Runtime) shutdown(ctx context.Context) {
 	if r.acmeHTTP != nil {
 		shutdownCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		if err := r.acmeHTTP.Shutdown(shutdownCtx); err != nil {
-			log.Printf("ACME HTTP shutdown: %v", err)
+			logger.Error("ACME HTTP shutdown error", "error", err)
 		}
 		cancel()
 	}

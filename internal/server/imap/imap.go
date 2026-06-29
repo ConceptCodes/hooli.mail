@@ -11,13 +11,13 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/mail"
 	"strings"
 	"time"
 
 	"hooli.mail/server/internal/auth"
+	"hooli.mail/server/internal/logger"
 	"hooli.mail/server/internal/mailbox"
 	"hooli.mail/server/internal/mailstore"
 	"hooli.mail/server/internal/message"
@@ -437,7 +437,7 @@ func NewServer(ctx context.Context, store mailstore.Store, authn *auth.Authentic
 	srv := imapserver.New(backend)
 	srv.Addr = addr
 	srv.AllowInsecureAuth = tlsCfg == nil
-	srv.ErrorLog = log.Default()
+	srv.ErrorLog = logger.Bridge()
 
 	if tlsCfg != nil {
 		srv.TLSConfig = tlsCfg
@@ -457,13 +457,13 @@ func (s *Server) Start() error {
 		if err != nil {
 			return fmt.Errorf("listen imaps: %w", err)
 		}
-		log.Printf("IMAPS server listening on %s (implicit TLS)", s.srv.Addr)
+		logger.Info("IMAPS server listening", "addr", s.srv.Addr, "tls", "implicit")
 	} else {
 		ln, err = net.Listen("tcp", s.srv.Addr)
 		if err != nil {
 			return fmt.Errorf("listen imap: %w", err)
 		}
-		log.Printf("IMAP server listening on %s (STARTTLS: %v)", s.srv.Addr, s.srv.TLSConfig != nil)
+		logger.Info("IMAP server listening", "addr", s.srv.Addr, "tls", s.srv.TLSConfig != nil)
 	}
 	return s.srv.Serve(ln)
 }
