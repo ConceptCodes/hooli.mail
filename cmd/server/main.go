@@ -98,10 +98,10 @@ func main() {
 
 	authn := auth.NewAuthenticator(store)
 
-	smtpReceiving := smtp.NewServer(store, authn, ":"+*smtpPort, nil, false, ctx)
-	smtpSubmission := smtp.NewServer(store, authn, ":"+*submissionPort, tlsConfig, true, ctx)
-	imapStartTLS := imap.NewServer(store, authn, ":"+*imapPort, tlsConfig, ctx)
-	imapTLS := imap.NewServer(store, authn, ":"+*imapsPort, tlsConfig, ctx)
+	smtpReceiving := smtp.NewServer(ctx, store, authn, ":"+*smtpPort, nil, false)
+	smtpSubmission := smtp.NewServer(ctx, store, authn, ":"+*submissionPort, tlsConfig, true)
+	imapStartTLS := imap.NewServer(ctx, store, authn, ":"+*imapPort, tlsConfig, false)
+	imapTLS := imap.NewServer(ctx, store, authn, ":"+*imapsPort, tlsConfig, true)
 
 	starters := []struct {
 		Name string
@@ -117,6 +117,13 @@ func main() {
 	// os.Exit from a goroutine (which would skip deferred cleanup).
 	errCh := make(chan error, len(starters)+1)
 	var wg sync.WaitGroup
+
+	// shutdown holds servers that need an explicit Close/Shutdown during
+	// teardown. The ACME HTTP server is retained here so we can drain its
+	// in-flight requests instead of killing them on process exit.
+	shutdown := struct {
+		acme *http.Server
+	}{}
 
 	run := func(name string, fn func() error) {
 		defer wg.Done()
@@ -134,10 +141,18 @@ func main() {
 		go func() {
 			defer wg.Done()
 			log.Println("Starting ACME HTTP challenge server on :80")
-			if err := http.ListenAndServe(":80", acmeMgr.HTTPHandler(nil)); err != nil {
-				if errors.Is(err, net.ErrClosed) || errors.Is(err, http.ErrServerClosed) {
-					return
-				}
+			// Retain the *http.Server so we can Shutdown it cleanly during
+			// teardown rather than letting in-flight ACME challenge requests
+			// get killed mid-flight. ListenAndServe always returns a non-nil
+			// error; http.ErrServerClosed / net.ErrClosed mean we shut it down
+			// ourselves and aren't fatal.
+			acmeSrv := &http.Server{
+				Addr:     ":80",
+				Handler:  acmeMgr.HTTPHandler(nil),
+				ErrorLog: log.Default(),
+			}
+			shutdown.acme = acmeSrv
+			if err := acmeSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
 				errCh <- fmt.Errorf("ACME HTTP server: %w", err)
 			}
 		}()
@@ -163,6 +178,15 @@ func main() {
 	smtpSubmission.Stop()
 	imapStartTLS.Stop()
 	imapTLS.Stop()
+	if shutdown.acme != nil {
+		// 5s is enough for an ACME challenge round-trip; we don't want a
+		// wedged connection to delay process exit.
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := shutdown.acme.Shutdown(shutdownCtx); err != nil {
+			log.Printf("ACME HTTP shutdown: %v", err)
+		}
+		shutdownCancel()
+	}
 	cancel()
 
 	// Give in-flight goroutines a chance to return, then bail. We don't wait

@@ -32,7 +32,7 @@ type IMAPBackend struct {
 	ctx   context.Context
 }
 
-func NewBackend(store mailstore.Store, authn *auth.Authenticator, ctx context.Context) *IMAPBackend {
+func NewBackend(ctx context.Context, store mailstore.Store, authn *auth.Authenticator) *IMAPBackend {
 	return &IMAPBackend{store: store, authn: authn, ctx: ctx}
 }
 
@@ -492,17 +492,25 @@ func applyFlagsOp(current []string, op imap.FlagsOp, flags []string) []string {
 }
 
 type Server struct {
-	srv    *imapserver.Server
-	cancel context.CancelFunc
+	srv         *imapserver.Server
+	cancel      context.CancelFunc
+	implicitTLS bool
 }
 
 // NewServer wires a mailstore.Store and auth.Authenticator into an IMAP server.
 // The context is propagated to every backend user so cancellation (shutdown,
 // timeout) reaches in-flight DB calls. When tlsCfg is nil, AllowInsecureAuth
 // is left false so no SASL PLAIN/LOGIN is accepted over plaintext.
-func NewServer(store mailstore.Store, authn *auth.Authenticator, addr string, tlsCfg *tls.Config, ctx context.Context) *Server {
+//
+// implicitTLS controls how TLS is presented on the listening socket. When false
+// (the IMAP/143 default), the listener is plaintext and TLS is offered via
+// STARTTLS. When true (the IMAPS/993 form), the listener itself is wrapped in
+// tls.Listen so every connection is TLS from the first byte — RFC 8314's
+// "implicit TLS". Setting srv.TLSConfig alone does not do this; go-imap would
+// otherwise accept plaintext on 993 and only upgrade inside the protocol.
+func NewServer(ctx context.Context, store mailstore.Store, authn *auth.Authenticator, addr string, tlsCfg *tls.Config, implicitTLS bool) *Server {
 	sessionCtx, cancel := context.WithCancel(ctx)
-	backend := NewBackend(store, authn, sessionCtx)
+	backend := NewBackend(sessionCtx, store, authn)
 	srv := imapserver.New(backend)
 	srv.Addr = addr
 	srv.AllowInsecureAuth = tlsCfg == nil
@@ -512,19 +520,35 @@ func NewServer(store mailstore.Store, authn *auth.Authenticator, addr string, tl
 		srv.TLSConfig = tlsCfg
 	}
 
-	return &Server{srv: srv, cancel: cancel}
+	return &Server{srv: srv, cancel: cancel, implicitTLS: implicitTLS}
 }
 
 func (s *Server) Start() error {
-	ln, err := net.Listen("tcp", s.srv.Addr)
-	if err != nil {
-		return fmt.Errorf("listen imap: %w", err)
+	var ln net.Listener
+	var err error
+	if s.implicitTLS {
+		if s.srv.TLSConfig == nil {
+			return fmt.Errorf("listen imap: implicitTLS requested without TLS config")
+		}
+		ln, err = tls.Listen("tcp", s.srv.Addr, s.srv.TLSConfig)
+		if err != nil {
+			return fmt.Errorf("listen imaps: %w", err)
+		}
+		log.Printf("IMAPS server listening on %s (implicit TLS)", s.srv.Addr)
+	} else {
+		ln, err = net.Listen("tcp", s.srv.Addr)
+		if err != nil {
+			return fmt.Errorf("listen imap: %w", err)
+		}
+		log.Printf("IMAP server listening on %s (STARTTLS: %v)", s.srv.Addr, s.srv.TLSConfig != nil)
 	}
-	log.Printf("IMAP server listening on %s (TLS: %v)", s.srv.Addr, s.srv.TLSConfig != nil)
 	return s.srv.Serve(ln)
 }
 
 func (s *Server) Stop() {
 	s.cancel()
-	s.srv.Close()
+	// Close terminates active connections and releases the listener. The
+	// returned error is only non-nil on double-close or already-closed
+	// listeners, neither of which is actionable here — we're shutting down.
+	_ = s.srv.Close()
 }

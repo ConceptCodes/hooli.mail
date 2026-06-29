@@ -143,7 +143,7 @@ func newAuthedBackend(t *testing.T) (*IMAPBackend, *models.User) {
 	if err != nil {
 		t.Fatalf("create user: %v", err)
 	}
-	return NewBackend(store, nil, context.Background()), u
+	return NewBackend(context.Background(), store, nil), u
 }
 
 func inboxOf(t *testing.T, b *IMAPBackend, u *models.User) *models.Mailbox {
