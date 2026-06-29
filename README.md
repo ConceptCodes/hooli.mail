@@ -85,6 +85,9 @@ The server will:
 ├── internal/
 │   ├── auth/            # Authentication & user management
 │   ├── config/          # Configuration management
+│   ├── delivery/        # Message delivery & recipient resolution
+│   ├── logger/          # Structured logging (slog wrapper)
+│   ├── mailbox/         # Mailbox search criteria & flag operations
 │   ├── mailstore/       # Email storage layer
 │   ├── message/         # Email message handling
 │   ├── models/          # Database models
@@ -166,6 +169,9 @@ go test ./...
 
 - **auth**: User authentication, password hashing, session management
 - **config**: Server configuration and environment variable parsing
+- **delivery**: Message delivery and recipient resolution
+- **logger**: Structured logging via slog
+- **mailbox**: Protocol-agnostic mailbox search and flag operations
 - **mailstore**: High-level email operations (send, receive, search, delete)
 - **message**: Email message parsing and RFC 5322 compliance
 - **models**: Data structures for users, messages, mailboxes
