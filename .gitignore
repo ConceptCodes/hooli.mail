@@ -3,3 +3,6 @@ notes.md
 bin/
 certs/
 .DS_Store
+
+AGENTS.MD
+.agents/
