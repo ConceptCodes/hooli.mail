@@ -8,8 +8,8 @@ golangci_version := "v2.12.2"
 # Build both server and TUI
 all: server tui
 
-# Run all CI checks: format, vet, golangci-lint, race tests
-ci: fmt-check vet lint test
+# Run all CI checks: format, vet, golangci-lint, race tests, image scan
+ci: fmt-check vet lint test image-scan
     @echo "All CI checks passed."
 
 # Format every Go file under the project
@@ -122,6 +122,11 @@ logs:
 # Stop docker-compose services
 stop:
     docker compose down
+
+# Scan the Docker image for HIGH/CRITICAL vulnerabilities (requires trivy)
+image-scan:
+    docker build -t {{app}}:scan .
+    trivy image --severity HIGH,CRITICAL --exit-code 1 {{app}}:scan
 
 # Clean build artifacts
 clean:
