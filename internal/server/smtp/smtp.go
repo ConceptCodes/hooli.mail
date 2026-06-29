@@ -1,7 +1,7 @@
 // Package smtp is the SMTP protocol adapter: it turns SMTP sessions into
-// delivery calls against a mailstore.Store and authenticates them via an
-// auth.Authenticator. It owns only the protocol-to-domain translation — storage
-// and credentials live behind their seams.
+// delivery calls against a delivery.Service and authenticates them via an
+// auth.Authenticator. It owns only the protocol-to-domain translation —
+// delivery policy, storage, and credentials live behind their seams.
 package smtp
 
 import (
@@ -15,22 +15,27 @@ import (
 	"strings"
 
 	"hooli.mail/server/internal/auth"
+	"hooli.mail/server/internal/delivery"
 	"hooli.mail/server/internal/mailstore"
-	"hooli.mail/server/internal/message"
 	"hooli.mail/server/internal/models"
 
 	gosmtp "github.com/emersion/go-smtp"
 )
 
 type Backend struct {
-	store       mailstore.Store
+	delivery    *delivery.Service
 	authn       *auth.Authenticator
 	requireAuth bool
 	ctx         context.Context
 }
 
 func NewBackend(ctx context.Context, store mailstore.Store, authn *auth.Authenticator, requireAuth bool) *Backend {
-	return &Backend{store: store, authn: authn, requireAuth: requireAuth, ctx: ctx}
+	return &Backend{
+		delivery:    delivery.New(store),
+		authn:       authn,
+		requireAuth: requireAuth,
+		ctx:         ctx,
+	}
 }
 
 func (b *Backend) NewSession(_ *gosmtp.Conn) (gosmtp.Session, error) {
@@ -110,55 +115,23 @@ func (s *Session) Data(r io.Reader) error {
 		return fmt.Errorf("read data: %w", err)
 	}
 
-	parsed := message.Parse(raw)
+	results := s.backend.delivery.Deliver(s.ctx, raw, s.to)
 
 	var lastErr error
 	delivered := 0
-	for _, recipient := range s.to {
-		if err := s.deliver(recipient, parsed); err != nil {
-			log.Printf("deliver to %s: %v", recipient, err)
-			lastErr = err
+	for _, r := range results {
+		if r.Err != nil {
+			log.Printf("deliver to %s: %v", r.Recipient, r.Err)
+			lastErr = r.Err
 			continue
 		}
 		delivered++
 	}
 
 	if delivered == 0 && len(s.to) > 0 {
-		// Every recipient failed — tell the client so it can retry / bounce.
 		return fmt.Errorf("delivery failed for all recipients: %w", lastErr)
 	}
 	return nil
-}
-
-func (s *Session) deliver(recipientEmail string, parsed message.Parsed) error {
-	u, err := s.backend.store.GetUserByEmail(s.ctx, recipientEmail)
-	if err != nil {
-		return fmt.Errorf("get recipient: %w", err)
-	}
-	if u == nil {
-		return fmt.Errorf("user not found: %s", recipientEmail)
-	}
-
-	inbox, err := s.backend.store.GetMailboxByName(s.ctx, u.ID, "INBOX")
-	if err != nil {
-		return fmt.Errorf("get inbox: %w", err)
-	}
-	if inbox == nil {
-		return fmt.Errorf("inbox not found for user %s", recipientEmail)
-	}
-
-	to := s.to
-	if to == nil {
-		to = []string{recipientEmail}
-	}
-
-	_, err = s.backend.store.Append(s.ctx, inbox.ID, mailstore.Message{
-		From:    s.from,
-		To:      to,
-		Subject: parsed.Subject,
-		Body:    parsed.Body,
-	})
-	return err
 }
 
 // Reset aborts the current mail transaction. Per RFC 5321 §4.1.1.5, RSET

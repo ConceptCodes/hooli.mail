@@ -7,7 +7,6 @@ import (
 	"testing"
 
 	"hooli.mail/server/internal/auth"
-	"hooli.mail/server/internal/mailstore"
 	"hooli.mail/server/internal/models"
 	"hooli.mail/server/internal/storage/memory"
 
@@ -248,15 +247,4 @@ func TestSessionAuthPlainWrongPassword(t *testing.T) {
 	if session.user != nil {
 		t.Error("user set after failed auth")
 	}
-}
-
-// TestBackendSatisfiesMailstore is a coverage helper that the IMAP adapter
-// test file can reuse. We assert the mailstore.Store contract holds here
-// too so a backend regression is caught without a running server.
-func TestBackendSatisfiesMailstore(t *testing.T) {
-	t.Parallel()
-	b, _, _ := newBackend(t, false)
-	// The explicit type annotation is the assertion — it forces a
-	// compile-time check that b.store satisfies mailstore.Store.
-	var _ mailstore.Store = b.store //nolint:staticcheck // QF1011: the type annotation is intentional
 }
