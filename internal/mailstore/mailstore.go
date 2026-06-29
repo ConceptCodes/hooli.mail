@@ -3,6 +3,8 @@ package mailstore
 import (
 	"context"
 
+	"hooli.mail/server/internal/mailbox"
+	"hooli.mail/server/internal/message"
 	"hooli.mail/server/internal/models"
 )
 
@@ -43,6 +45,16 @@ type Store interface {
 	SetFlags(ctx context.Context, emailID int64, flags []string) error
 	DeleteMessage(ctx context.Context, emailID int64) error
 
+	// Search returns the IDs of messages in the Mailbox that match the
+	// criteria. The criteria evaluation is owned by the mailbox package;
+	// the store delegates to mailbox.Match.
+	Search(ctx context.Context, mailboxID int64, criteria mailbox.SearchCriteria) ([]int64, error)
+
+	// UpdateFlags applies a flag operation to the given messages in one
+	// semantic unit. The flag operation is owned by the mailbox package;
+	// the store delegates to mailbox.ApplyFlags.
+	UpdateFlags(ctx context.Context, mailboxID int64, ids []int64, op mailbox.FlagOperation, flags []string) error
+
 	// --- Deepened bulk operations ---
 
 	// Expunge deletes every message in the Mailbox carrying \Deleted and returns
@@ -54,14 +66,13 @@ type Store interface {
 	Copy(ctx context.Context, srcMailboxID int64, ids []int64, destMailboxID int64) error
 }
 
-// Message is the "a sender wants to store this" value handed to Append. It is
-// the parsed, domain form of a piece of mail before it becomes a stored Email.
+// Message is the "a sender wants to store this" value handed to Append. It
+// carries the canonical parsed message (which owns raw bytes and all derived
+// envelope fields) plus optional flags. The message module owns parsing;
+// the store extracts what it needs for persistence.
 type Message struct {
-	From    string
-	To      []string
-	Subject string
-	Body    string
-	Flags   []string
+	Parsed message.Message
+	Flags  []string
 }
 
 // Status is the result of Store.Status — the IMAP mailbox counters computed in
