@@ -23,6 +23,8 @@ const (
 	inboxView
 	messageView
 	composeView
+	draftConfirmView // "save draft / discard / keep writing" modal over compose
+	draftsView       // list of saved drafts
 )
 
 type dateGroup int
@@ -59,19 +61,21 @@ type model struct {
 	emails  []mail.Summary
 	cursor  int
 	total   int
-	offset  int
 
-	viewing *mail.Full
+	viewing  *mail.Full
 	viewport viewport.Model
 
 	composeTo      textinput.Model
 	composeSubject textinput.Model
 	composeBody    string
 	composeCursor  int
-	composeBuf     []string
 
 	err     error
 	loading string
+
+	// in-session drafts (lost on quit, but survive inbox round-trips)
+	drafts       []draftData
+	draftsCursor int
 }
 
 // New builds a TUI model backed by a real IMAP/SMTP session.
@@ -180,27 +184,44 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		m.viewport.Width = msg.Width - 4
-		m.viewport.Height = msg.Height - 8
+		m.viewport.Height = msg.Height - 10
 
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "ctrl+c":
 			return m, tea.Quit
 		case "ctrl+q":
-			if m.state == inboxView || m.state == loginView {
+			if m.state == inboxView || m.state == loginView || m.state == draftsView {
 				return m, tea.Quit
 			}
 		case "q":
 			if m.state == inboxView && len(m.emails) == 0 {
 				return m, tea.Quit
 			}
-		case "escape":
+			if m.state == draftsView {
+				m.state = inboxView
+				return m, nil
+			}
+		case "esc", "escape":
 			switch m.state {
 			case messageView:
 				m.state = inboxView
 				m.viewing = nil
 				return m, nil
 			case composeView:
+				hasContent := strings.TrimSpace(m.composeTo.Value()) != "" ||
+					strings.TrimSpace(m.composeSubject.Value()) != "" ||
+					strings.TrimSpace(m.composeBody) != ""
+				if hasContent {
+					m.state = draftConfirmView
+				} else {
+					m.state = inboxView
+				}
+				return m, nil
+			case draftConfirmView:
+				m.state = composeView
+				return m, nil
+			case draftsView:
 				m.state = inboxView
 				return m, nil
 			}
@@ -222,6 +243,18 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.state = messageView
 					m.viewing = nil
 					return m, m.fetchMessage(m.emails[m.cursor].UID)
+				}
+			case draftsView:
+				if len(m.drafts) > 0 {
+					d := m.drafts[m.draftsCursor]
+					m.composeTo.SetValue(d.To)
+					m.composeSubject.SetValue(d.Subject)
+					m.composeBody = d.Body
+					m.composeCursor = 0
+					m.composeTo.Focus()
+					m.drafts = append(m.drafts[:m.draftsCursor], m.drafts[m.draftsCursor+1:]...)
+					m.state = composeView
+					return m, nil
 				}
 			}
 		case "tab":
@@ -247,22 +280,30 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "up", "k":
 			if m.state == inboxView && m.cursor > 0 {
 				m.cursor--
-				m.ensureVisible()
+			}
+			if m.state == draftsView && m.draftsCursor > 0 {
+				m.draftsCursor--
 			}
 		case "down", "j":
 			if m.state == inboxView && m.cursor < len(m.emails)-1 {
 				m.cursor++
-				m.ensureVisible()
+			}
+			if m.state == draftsView && m.draftsCursor < len(m.drafts)-1 {
+				m.draftsCursor++
 			}
 		case "g":
 			if m.state == inboxView {
 				m.cursor = 0
-				m.offset = 0
+			}
+			if m.state == draftsView {
+				m.draftsCursor = 0
 			}
 		case "G":
-			if m.state == inboxView {
+			if m.state == inboxView && len(m.emails) > 0 {
 				m.cursor = len(m.emails) - 1
-				m.ensureVisible()
+			}
+			if m.state == draftsView && len(m.drafts) > 0 {
+				m.draftsCursor = len(m.drafts) - 1
 			}
 		case "r":
 			if m.state == inboxView && m.session != nil {
@@ -274,16 +315,30 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.composeTo.SetValue("")
 				m.composeSubject.SetValue("")
 				m.composeBody = ""
-				m.composeBuf = nil
 				m.composeCursor = 0
 				m.composeTo.Focus()
-				m.composeTo.Prompt = ""
-				m.composeSubject.Prompt = ""
 				m.state = composeView
 				return m, nil
 			}
+		case "D":
+			if m.state == inboxView && len(m.drafts) > 0 {
+				m.state = draftsView
+				m.draftsCursor = 0
+				return m, nil
+			}
+		case "d":
+			if m.state == draftsView && len(m.drafts) > 0 {
+				m.drafts = append(m.drafts[:m.draftsCursor], m.drafts[m.draftsCursor+1:]...)
+				if m.draftsCursor >= len(m.drafts) && m.draftsCursor > 0 {
+					m.draftsCursor--
+				}
+				if len(m.drafts) == 0 {
+					m.state = inboxView
+				}
+				return m, nil
+			}
 		case "ctrl+s":
-			if m.state == composeView && m.composeCursor == 2 {
+			if m.state == composeView || m.state == draftConfirmView {
 				m.loading = "Sending"
 				return m, m.sendMail()
 			}
@@ -299,7 +354,6 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.state = inboxView
 		m.loggedInUser = m.username
 		m.cursor = 0
-		m.offset = 0
 		m.emails = msg.emails
 		m.total = len(msg.emails)
 
@@ -369,6 +423,26 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		var cmd tea.Cmd
 		m.viewport, cmd = m.viewport.Update(msg)
 		cmds = append(cmds, cmd)
+
+	case draftConfirmView:
+		if keyMsg, ok := msg.(tea.KeyMsg); ok {
+			switch keyMsg.String() {
+			case "s":
+				m.drafts = append(m.drafts, draftData{
+					To:      m.composeTo.Value(),
+					Subject: m.composeSubject.Value(),
+					Body:    m.composeBody,
+				})
+				m.state = inboxView
+				return m, nil
+			case "d":
+				m.state = inboxView
+				return m, nil
+			case "k":
+				m.state = composeView
+				return m, nil
+			}
+		}
 	}
 
 	return m, tea.Batch(cmds...)
@@ -401,19 +475,6 @@ func (m *model) retreatComposeField() {
 	case 2:
 		m.composeCursor = 1
 		m.composeSubject.Focus()
-	}
-}
-
-func (m *model) ensureVisible() {
-	rows := m.height - 4
-	half := rows / 2
-	if m.cursor < m.offset {
-		m.offset = m.cursor
-	} else if m.cursor >= m.offset+rows {
-		m.offset = m.cursor - rows + 1
-	}
-	if m.cursor-m.offset < half && m.offset > 0 {
-		m.offset = max(0, m.cursor-half)
 	}
 }
 
@@ -486,6 +547,10 @@ func (m *model) View() string {
 		return m.messageView()
 	case composeView:
 		return m.composeView()
+	case draftConfirmView:
+		return m.renderDraftConfirm()
+	case draftsView:
+		return m.draftsView()
 	}
 	return ""
 }
@@ -499,13 +564,15 @@ func (m *model) loadingView() string {
 }
 
 func (m *model) loginView() string {
-	contentWidth := m.width
-	if contentWidth < 40 {
-		contentWidth = 40
+	formW := m.width
+	if formW < 40 {
+		formW = 40
 	}
-	if contentWidth > 80 {
-		contentWidth = 80
+	if formW > 60 {
+		formW = 60
 	}
+
+	rule := m.styles.Muted.Render(strings.Repeat("\u2500", formW))
 
 	title := lipgloss.JoinVertical(lipgloss.Center,
 		m.styles.Primary.Bold(true).Render("Hooli Mail"),
@@ -519,9 +586,9 @@ func (m *model) loginView() string {
 
 	var hint string
 	if m.emailInput.Focused() {
-		hint = m.styles.Muted.Render("enter email · tab to password")
+		hint = m.styles.Muted.Render("enter email  \u00b7  tab to switch")
 	} else {
-		hint = m.styles.Muted.Render("enter password · tab to email · enter to login")
+		hint = m.styles.Muted.Render("enter password  \u00b7  tab to switch  \u00b7  enter to sign in")
 	}
 
 	var errStr string
@@ -535,12 +602,13 @@ func (m *model) loginView() string {
 		Align(lipgloss.Center, lipgloss.Center).
 		Render(
 			lipgloss.JoinVertical(lipgloss.Center,
-				"",
 				title,
 				"",
+				rule,
 				"",
 				inputBox,
 				"",
+				rule,
 				"",
 				errStr,
 				hint,
@@ -554,62 +622,191 @@ func (m *model) inboxView() string {
 		contentW = 40
 	}
 
-	statusLine := fmt.Sprintf("  %s  %s  %s",
-		m.styles.StatusBold.Render("INBOX"),
-		m.styles.StatusAccent.Render(fmt.Sprintf("%d", m.total)),
-		m.styles.Muted.Render(fmt.Sprintf("@%s", m.loggedInUser)),
-	)
+	dot := m.styles.Muted.Render(" \u00b7 ")
+	statusLine := "  " +
+		m.styles.StatusBold.Render("INBOX") +
+		dot +
+		m.styles.StatusAccent.Render(fmt.Sprintf("%d", m.total)) +
+		dot +
+		m.styles.Muted.Render("@" + m.loggedInUser)
+	if n := len(m.drafts); n > 0 {
+		noun := "draft"
+		if n > 1 {
+			noun = "drafts"
+		}
+		statusLine += dot + m.styles.Muted.Render(fmt.Sprintf("[%d %s]", n, noun))
+	}
 
-	var rows []string
-	rows = append(rows, statusLine)
-	rows = append(rows, m.styles.Muted.Render(strings.Repeat("\u2500", max(0, contentW-4))))
+	rule := m.styles.Muted.Render(strings.Repeat("\u2500", max(0, contentW-4)))
 
+	// Fixed chrome: statusLine + topRule + bottomRule + footer = 4 lines.
+	// An error line (with leading blank) steals 2 more.
+	availHeight := m.height - 4
+	var errBlock string
+	if m.err != nil {
+		errBlock = m.styles.Error.Render(m.err.Error())
+		availHeight -= 2
+	}
+	if availHeight < 1 {
+		availHeight = 1
+	}
+
+	var middle string
 	if len(m.emails) == 0 {
 		empty := lipgloss.JoinVertical(lipgloss.Center,
 			"",
 			m.styles.Muted.Render("No messages yet"),
 			"",
-			m.styles.Muted.Render("c to compose  r to refresh"),
+			m.styles.Muted.Render("c to compose  \u00b7  r to refresh"),
 		)
-		rows = append(rows, empty)
+		middle = padToHeight(empty, availHeight)
 	} else {
 		bodyW := contentW - 4
-		rows = append(rows, m.renderEmailList(bodyW))
+		middle = m.renderEmailList(bodyW, availHeight)
 	}
 
+	rows := []string{statusLine, rule, middle}
 	if m.err != nil {
-		rows = append(rows, "")
-		rows = append(rows, m.styles.Error.Render(m.err.Error()))
+		rows = append(rows, "", errBlock)
 	}
+	rows = append(rows, rule, m.renderInboxFooter())
 
-	footer := m.styles.Footer.Render(formatInboxFooter())
-	rows = append(rows, footer)
-
-	return lipgloss.NewStyle().Width(m.width).Height(m.height).Render(
+	return lipgloss.NewStyle().Width(m.width).Render(
 		lipgloss.JoinVertical(lipgloss.Left, rows...),
 	)
 }
 
-func formatInboxFooter() string {
-	return "\u2022 j/k navigate  \u2022 enter read  \u2022 c compose  \u2022 r refresh  \u2022 q quit"
+func (m *model) renderInboxFooter() string {
+	k := func(s string) string { return m.styles.StatusAccent.Render("[" + s + "]") }
+	v := func(s string) string { return m.styles.Footer.Render(" " + s) }
+	sep := m.styles.Muted.Render("  ")
+	return "  " +
+		k("j/k") + v("navigate") + sep +
+		k("enter") + v("read") + sep +
+		k("c") + v("compose") + sep +
+		k("D") + v("drafts") + sep +
+		k("r") + v("refresh") + sep +
+		k("q") + v("quit")
 }
 
-func (m *model) renderEmailList(bodyW int) string {
+func (m *model) renderMessageFooter() string {
+	k := func(s string) string { return m.styles.StatusAccent.Render("[" + s + "]") }
+	v := func(s string) string { return m.styles.Footer.Render(" " + s) }
+	sep := m.styles.Muted.Render("  ")
+	return "  " + k("esc") + v("back") + sep + k("\u2191/\u2193") + v("scroll")
+}
+
+func (m *model) renderComposeFooter() string {
+	k := func(s string) string { return m.styles.StatusAccent.Render("[" + s + "]") }
+	v := func(s string) string { return m.styles.Footer.Render(" " + s) }
+	sep := m.styles.Muted.Render("  ")
+	return "  " + k("tab") + v("next") + sep + k("^S") + v("send") + sep + k("esc") + v("cancel")
+}
+
+func (m *model) renderDraftsFooter() string {
+	k := func(s string) string { return m.styles.StatusAccent.Render("[" + s + "]") }
+	v := func(s string) string { return m.styles.Footer.Render(" " + s) }
+	sep := m.styles.Muted.Render("  ")
+	return "  " + k("j/k") + v("navigate") + sep + k("enter") + v("resume") + sep + k("d") + v("delete") + sep + k("esc") + v("back")
+}
+
+func (m *model) renderDraftConfirm() string {
+	k := func(s string) string { return m.styles.StatusAccent.Render("[" + s + "]") }
+
+	var subjectPreview string
+	if s := strings.TrimSpace(m.composeSubject.Value()); s != "" {
+		subjectPreview = m.styles.Muted.Render("  " + truncate(s, 40))
+	}
+
+	body := lipgloss.JoinVertical(lipgloss.Left,
+		m.styles.Primary.Bold(true).Render("Abandon draft?"),
+		subjectPreview,
+		"",
+		k("s")+" "+m.styles.Secondary.Render("save for later"),
+		k("d")+" "+m.styles.Secondary.Render("discard"),
+		k("k")+" "+m.styles.Secondary.Render("keep writing"),
+	)
+
+	modal := m.styles.ModalBox.Render(body)
+
+	return lipgloss.NewStyle().
+		Width(m.width).
+		Height(m.height).
+		Align(lipgloss.Center, lipgloss.Center).
+		Render(modal)
+}
+
+// truncate shortens s to at most n runes, appending … if needed.
+func truncate(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n-1]) + "\u2026"
+}
+
+// padToHeight pads content with blank lines so it occupies exactly height lines.
+func padToHeight(content string, height int) string {
+	lines := strings.Split(content, "\n")
+	for len(lines) < height {
+		lines = append(lines, "")
+	}
+	return strings.Join(lines, "\n")
+}
+
+// windowLines slices a list of display lines to maxLines, keeping the cursor
+// line roughly centered when scrolling is needed.
+func windowLines(lines []string, cursorLine, maxLines int) []string {
+	if len(lines) <= maxLines {
+		out := lines
+		for len(out) < maxLines {
+			out = append(out, "")
+		}
+		return out
+	}
+
+	half := maxLines / 2
+	start := 0
+	switch {
+	case cursorLine < half:
+		start = 0
+	case cursorLine >= len(lines)-half:
+		start = len(lines) - maxLines
+	default:
+		start = cursorLine - half
+	}
+	if start < 0 {
+		start = 0
+	}
+
+	end := start + maxLines
+	if end > len(lines) {
+		end = len(lines)
+	}
+	return lines[start:end]
+}
+
+func (m *model) renderEmailList(bodyW, maxLines int) string {
 	groups := m.buildGroups()
 	var lines []string
+	cursorLine := 0
 
 	for _, g := range groups {
-		lines = append(lines, m.styles.Group.Render("  "+g.label))
-		lines = append(lines, "")
+		label := "  " + g.label + "  "
+		ruleLen := max(0, bodyW-len(label))
+		groupLine := m.styles.Group.Render(label) + m.styles.Muted.Render(strings.Repeat("\u2500", ruleLen))
+		lines = append(lines, groupLine)
 
 		for _, idx := range g.indices {
-			email := m.emails[idx]
-			selected := idx == m.cursor
-			lines = append(lines, m.renderRow(email, selected, bodyW))
+			if idx == m.cursor {
+				cursorLine = len(lines)
+			}
+			lines = append(lines, m.renderRow(m.emails[idx], idx == m.cursor, bodyW))
 		}
 	}
 
-	return lipgloss.JoinVertical(lipgloss.Left, lines...)
+	visible := windowLines(lines, cursorLine, maxLines)
+	return lipgloss.JoinVertical(lipgloss.Left, visible...)
 }
 
 type groupInfo struct {
@@ -618,8 +815,6 @@ type groupInfo struct {
 }
 
 func (m *model) buildGroups() []groupInfo {
-	// Start from a sentinel no real group can equal, so the first message always
-	// initialises `current` rather than appending to an unlabelled group.
 	const groupNone dateGroup = -1
 	currentGroup := groupNone
 	var groups []groupInfo
@@ -650,14 +845,14 @@ func (m *model) buildGroups() []groupInfo {
 func (m *model) renderRow(email mail.Summary, selected bool, width int) string {
 	fromW := 20
 	dateW := 10
-	subjW := width - 2 - fromW - dateW - 4
+	subjW := width - 1 - 2 - 1 - fromW - 1 - dateW - 2
 	if subjW < 10 {
 		subjW = 10
 	}
 
-	seal := "  "
+	sealStr := "  "
 	if !email.Seen {
-		seal = m.styles.Seal.Render("\u2588\u2588")
+		sealStr = m.styles.Seal.Render("\u2588\u2588")
 	}
 
 	from := email.From
@@ -687,28 +882,26 @@ func (m *model) renderRow(email mail.Summary, selected bool, width int) string {
 		dateStr = email.Date.Format("Jan 02")
 	}
 
-	var line string
+	fromPadded := fmt.Sprintf("%-*s", fromW, from)
+	subjPadded := fmt.Sprintf("%-*s", subjW, subject)
+
+	var content string
 	if !email.Seen {
-		fromPadded := fmt.Sprintf("%-*s", fromW, from)
-		subjPadded := fmt.Sprintf("%-*s", subjW, subject)
-		line = seal + " " +
+		content = sealStr + " " +
 			m.styles.Primary.Bold(true).Render(fromPadded) + " " +
 			m.styles.Secondary.Bold(true).Render(subjPadded) + " " +
 			m.styles.Muted.Render(dateStr)
 	} else {
-		fromPadded := fmt.Sprintf("%-*s", fromW, from)
-		subjPadded := fmt.Sprintf("%-*s", subjW, subject)
-		line = seal + " " +
-			m.styles.Primary.Render(fromPadded) + " " +
-			m.styles.Secondary.Render(subjPadded) + " " +
+		content = sealStr + " " +
+			m.styles.Secondary.Render(fromPadded) + " " +
+			m.styles.Muted.Render(subjPadded) + " " +
 			m.styles.Muted.Render(dateStr)
 	}
 
 	if selected {
-		line = m.styles.Cursor.Render(line)
+		return m.styles.CursorBar.Render("\u258c") + m.styles.Cursor.Render(content)
 	}
-
-	return line
+	return " " + content
 }
 
 func (m *model) messageView() string {
@@ -722,9 +915,9 @@ func (m *model) messageView() string {
 
 	subject := m.styles.Subject.Render(m.viewing.Subject)
 
-	metaFrom := fmt.Sprintf("%s %s", m.styles.MetaLabel.Render("From:"), m.styles.Secondary.Render(m.viewing.From))
-	metaTo := fmt.Sprintf("%s %s", m.styles.MetaLabel.Render("To:"), m.styles.Secondary.Render(strings.Join(m.viewing.To, ", ")))
-	metaDate := fmt.Sprintf("%s %s", m.styles.MetaLabel.Render("Date:"), m.styles.Secondary.Render(m.viewing.Date.Format("Mon 2 Jan 2006 at 15:04")))
+	metaFrom := fmt.Sprintf("%s %s", m.styles.MetaKey.Render("From:"), m.styles.MetaVal.Render(m.viewing.From))
+	metaTo := fmt.Sprintf("%s %s", m.styles.MetaKey.Render("To:"), m.styles.MetaVal.Render(strings.Join(m.viewing.To, ", ")))
+	metaDate := fmt.Sprintf("%s %s", m.styles.MetaKey.Render("Date:"), m.styles.MetaVal.Render(m.viewing.Date.Format("Mon 2 Jan 2006 at 15:04")))
 
 	bodyW := contentW - 4
 	body := m.viewing.Body
@@ -740,28 +933,27 @@ func (m *model) messageView() string {
 	}
 	m.viewport.SetContent(body)
 	m.viewport.Width = bodyW
-	m.viewport.Height = m.height - 12
+	// Header is 8 lines (back + blank + subject + blank + from + to + date + rule).
+	// Footer is 2 lines (rule + footer). Viewport fills the rest.
+	m.viewport.Height = m.height - 10
 
-	footer := m.styles.Footer.Render(formatMessageFooter())
+	rule := m.styles.Muted.Render(strings.Repeat("\u2500", max(0, contentW-4)))
 
-	return lipgloss.NewStyle().Width(m.width).Height(m.height).Render(
+	return lipgloss.NewStyle().Width(m.width).Render(
 		lipgloss.JoinVertical(lipgloss.Left,
 			"  "+back,
 			"",
-			subject,
+			"  "+subject,
 			"",
 			"  "+metaFrom,
 			"  "+metaTo,
 			"  "+metaDate,
-			m.styles.Muted.Render(strings.Repeat("\u2500", max(0, contentW-4))),
+			rule,
 			m.viewport.View(),
-			footer,
+			rule,
+			m.renderMessageFooter(),
 		),
 	)
-}
-
-func formatMessageFooter() string {
-	return "\u2022 esc back  \u2022 \u2191/\u2193 scroll"
 }
 
 func (m *model) composeView() string {
@@ -769,40 +961,120 @@ func (m *model) composeView() string {
 	if contentW > 72 {
 		contentW = 72
 	}
-	fieldW := contentW - 10
-	if fieldW < 30 {
-		fieldW = 30
-	}
 
 	header := m.styles.Primary.Bold(true).Render("New Message")
+	rule := m.styles.Muted.Render(strings.Repeat("\u2500", contentW))
 
-	toField := m.styles.ComposeLabel.Render("To:") + " " + m.composeTo.View()
-	subjField := m.styles.ComposeLabel.Render("Subj:") + " " + m.composeSubject.View()
+	activeLabel := func(label string, cursor int, field int) string {
+		if cursor == field {
+			return m.styles.Secondary.Width(6).Align(lipgloss.Right).Render(label)
+		}
+		return m.styles.ComposeLabel.Render(label)
+	}
+
+	toField := activeLabel("To:", m.composeCursor, 0) + " " + m.composeTo.View()
+	subjField := activeLabel("Subj:", m.composeCursor, 1) + " " + m.composeSubject.View()
 
 	bodyContent := m.composeBody
-	if bodyContent == "" {
+	if m.composeCursor == 2 {
+		bodyContent += m.styles.Seal.Render("\u2588")
+	} else if bodyContent == "" {
 		bodyContent = m.styles.Muted.Render("Write your message...")
 	}
-	bodyField := m.styles.ComposeLabel.Render("Body:") + " " + bodyContent
+	bodyField := activeLabel("Body:", m.composeCursor, 2) + " " + bodyContent
 
-	footer := m.styles.Footer.Render(formatComposeFooter())
-
-	return lipgloss.JoinVertical(lipgloss.Left,
-		"  "+header,
-		"",
-		"  "+toField,
-		"  "+subjField,
-		"  "+bodyField,
-		"",
-		footer,
+	return lipgloss.NewStyle().Width(m.width).Height(m.height).Render(
+		lipgloss.JoinVertical(lipgloss.Left,
+			"  "+header,
+			rule,
+			"",
+			"  "+toField,
+			"  "+subjField,
+			"",
+			"  "+bodyField,
+			"",
+			rule,
+			m.renderComposeFooter(),
+		),
 	)
 }
 
-func formatComposeFooter() string {
-	return "\u2022 tab next  \u2022 enter newline  \u2022 ^S send  \u2022 esc cancel"
+func (m *model) draftsView() string {
+	contentW := m.width - 4
+	if contentW < 40 {
+		contentW = 40
+	}
+
+	header := m.styles.Primary.Bold(true).Render("Drafts")
+	rule := m.styles.Muted.Render(strings.Repeat("\u2500", max(0, contentW-4)))
+
+	// Fixed chrome: header + topRule + bottomRule + footer = 4 lines.
+	availHeight := m.height - 4
+	if availHeight < 1 {
+		availHeight = 1
+	}
+
+	bodyW := contentW - 4
+	fromW := 24
+	subjW := bodyW - fromW - 3
+	if subjW < 10 {
+		subjW = 10
+	}
+
+	var lines []string
+	for i, d := range m.drafts {
+		selected := i == m.draftsCursor
+
+		to := d.To
+		if to == "" {
+			to = "(no recipient)"
+		}
+		subject := d.Subject
+		if subject == "" {
+			subject = "(no subject)"
+		}
+		if len([]rune(to)) > fromW {
+			to = string([]rune(to)[:fromW-1]) + "\u2026"
+		}
+		if len([]rune(subject)) > subjW {
+			subject = string([]rune(subject)[:subjW-1]) + "\u2026"
+		}
+
+		fromPadded := fmt.Sprintf("%-*s", fromW, to)
+		subjPadded := fmt.Sprintf("%-*s", subjW, subject)
+
+		content := m.styles.Secondary.Render(fromPadded) + " " +
+			m.styles.Muted.Render(subjPadded)
+
+		if selected {
+			lines = append(lines, m.styles.CursorBar.Render("\u258c")+m.styles.Cursor.Render(content))
+		} else {
+			lines = append(lines, " "+content)
+		}
+	}
+
+	visible := windowLines(lines, m.draftsCursor, availHeight)
+
+	return lipgloss.NewStyle().Width(m.width).Render(
+		lipgloss.JoinVertical(lipgloss.Left,
+			"  "+header,
+			rule,
+			lipgloss.JoinVertical(lipgloss.Left, visible...),
+			rule,
+			m.renderDraftsFooter(),
+		),
+	)
 }
 
 // --- messages ---
+
+// draftData holds a compose session that the user chose to save for later.
+// It lives only in memory for the lifetime of the process.
+type draftData struct {
+	To      string
+	Subject string
+	Body    string
+}
 
 type loginSuccess struct {
 	emails []mail.Summary
