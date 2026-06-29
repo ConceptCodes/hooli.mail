@@ -2,9 +2,11 @@ package memory
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"hooli.mail/server/internal/mailstore"
+	"hooli.mail/server/internal/message"
 	"hooli.mail/server/internal/models"
 )
 
@@ -31,8 +33,16 @@ func inboxOf(t *testing.T, s *Store, userID int64) *models.Mailbox {
 
 func appendMsg(t *testing.T, s *Store, mailboxID int64, flags []string) *models.Email {
 	t.Helper()
+	raw := []byte(strings.Join([]string{
+		"From: f@x.com",
+		"To: user@x.com",
+		"Subject: s",
+		"",
+		"b",
+	}, "\r\n"))
 	e, err := s.Append(context.Background(), mailboxID, mailstore.Message{
-		From: "f@x.com", To: []string{"user@x.com"}, Subject: "s", Body: "b", Flags: flags,
+		Parsed: message.Parse(raw),
+		Flags:  flags,
 	})
 	if err != nil {
 		t.Fatalf("append: %v", err)
@@ -215,4 +225,145 @@ func hasStr(slice []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// TestRoundTripPreservesCanonicalMessage is the ingress-to-fetch round trip:
+// a message with full headers (Cc, Message-ID, In-Reply-To, display names)
+// is parsed, stored via Append, and retrieved via List. Every field that
+// message.Parse extracts must survive the storage round trip — this is the
+// single test that pins the canonical representation contract.
+func TestRoundTripPreservesCanonicalMessage(t *testing.T) {
+	s := New()
+	u := newTestUser(t, s)
+	mb := inboxOf(t, s, u.ID)
+
+	raw := []byte(strings.Join([]string{
+		"From: Alice <alice@example.com>",
+		"To: bob@example.com, Carol <carol@example.com>",
+		"Cc: dave@example.com",
+		"Subject: Round trip test",
+		"Message-ID: <rt-123@example.com>",
+		"In-Reply-To: <parent@example.com>",
+		"Date: Mon, 02 Jan 2024 15:04:05 -0700",
+		"",
+		"This is the body.",
+	}, "\r\n"))
+
+	stored, err := s.Append(context.Background(), mb.ID, mailstore.Message{
+		Parsed: message.Parse(raw),
+	})
+	if err != nil {
+		t.Fatalf("append: %v", err)
+	}
+
+	// Verify the returned Email carries canonical data.
+	if stored.Size != len(raw) {
+		t.Errorf("returned Size = %d, want %d (len of raw)", stored.Size, len(raw))
+	}
+	if stored.MessageID != "<rt-123@example.com>" {
+		t.Errorf("returned MessageID = %q", stored.MessageID)
+	}
+	if stored.InReplyTo != "<parent@example.com>" {
+		t.Errorf("returned InReplyTo = %q", stored.InReplyTo)
+	}
+	if len(stored.Cc) != 1 || stored.Cc[0] != "dave@example.com" {
+		t.Errorf("returned Cc = %v", stored.Cc)
+	}
+	if string(stored.Raw) != string(raw) {
+		t.Errorf("returned Raw does not match input")
+	}
+
+	// Retrieve via List and verify the same data survives the read path.
+	got, err := s.List(context.Background(), mb.ID)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d emails, want 1", len(got))
+	}
+	e := got[0]
+
+	if e.From != "Alice <alice@example.com>" {
+		t.Errorf("From = %q", e.From)
+	}
+	if len(e.To) != 2 || e.To[0] != "bob@example.com" || e.To[1] != "Carol <carol@example.com>" {
+		t.Errorf("To = %v", e.To)
+	}
+	if len(e.Cc) != 1 || e.Cc[0] != "dave@example.com" {
+		t.Errorf("Cc = %v", e.Cc)
+	}
+	if e.Subject != "Round trip test" {
+		t.Errorf("Subject = %q", e.Subject)
+	}
+	if e.MessageID != "<rt-123@example.com>" {
+		t.Errorf("MessageID = %q", e.MessageID)
+	}
+	if e.InReplyTo != "<parent@example.com>" {
+		t.Errorf("InReplyTo = %q", e.InReplyTo)
+	}
+	if e.Size != len(raw) {
+		t.Errorf("Size = %d, want %d", e.Size, len(raw))
+	}
+	if string(e.Raw) != string(raw) {
+		t.Errorf("Raw does not match input after List")
+	}
+	if !strings.Contains(e.Body, "This is the body") {
+		t.Errorf("Body = %q", e.Body)
+	}
+}
+
+// TestCopyPreservesRawAndMetadata verifies that Copy duplicates the raw bytes
+// and canonical metadata, not just the flat display fields.
+func TestCopyPreservesRawAndMetadata(t *testing.T) {
+	s := New()
+	u := newTestUser(t, s)
+	inbox := inboxOf(t, s, u.ID)
+
+	raw := []byte(strings.Join([]string{
+		"From: sender@example.com",
+		"To: user@x.com",
+		"Cc: cc@example.com",
+		"Subject: copy me",
+		"Message-ID: <copy-123@example.com>",
+		"",
+		"body content",
+	}, "\r\n"))
+
+	src, err := s.Append(context.Background(), inbox.ID, mailstore.Message{
+		Parsed: message.Parse(raw),
+	})
+	if err != nil {
+		t.Fatalf("append: %v", err)
+	}
+
+	dest, err := s.CreateMailbox(context.Background(), u.ID, "Archive")
+	if err != nil {
+		t.Fatalf("create archive: %v", err)
+	}
+
+	if err := s.Copy(context.Background(), inbox.ID, []int64{src.ID}, dest.ID); err != nil {
+		t.Fatalf("copy: %v", err)
+	}
+
+	copied, err := s.List(context.Background(), dest.ID)
+	if err != nil {
+		t.Fatalf("list dest: %v", err)
+	}
+	if len(copied) != 1 {
+		t.Fatalf("dest has %d, want 1", len(copied))
+	}
+	c := copied[0]
+
+	if c.MessageID != "<copy-123@example.com>" {
+		t.Errorf("copied MessageID = %q", c.MessageID)
+	}
+	if len(c.Cc) != 1 || c.Cc[0] != "cc@example.com" {
+		t.Errorf("copied Cc = %v", c.Cc)
+	}
+	if c.Size != len(raw) {
+		t.Errorf("copied Size = %d, want %d", c.Size, len(raw))
+	}
+	if string(c.Raw) != string(raw) {
+		t.Errorf("copied Raw does not match source")
+	}
 }

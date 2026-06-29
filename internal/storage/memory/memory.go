@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"hooli.mail/server/internal/mailbox"
 	"hooli.mail/server/internal/mailstore"
 	"hooli.mail/server/internal/models"
 )
@@ -72,8 +73,14 @@ func cloneEmail(e *models.Email) *models.Email {
 	if e.To != nil {
 		c.To = append([]string(nil), e.To...)
 	}
+	if e.Cc != nil {
+		c.Cc = append([]string(nil), e.Cc...)
+	}
 	if e.Flags != nil {
 		c.Flags = append([]string(nil), e.Flags...)
+	}
+	if e.Raw != nil {
+		c.Raw = append([]byte(nil), e.Raw...)
 	}
 	return &c
 }
@@ -198,16 +205,21 @@ func (s *Store) Append(_ context.Context, mailboxID int64, msg mailstore.Message
 	if len(flags) == 0 {
 		flags = []string{models.FlagRecent}
 	}
+	p := msg.Parsed
 	e := &models.Email{
 		ID:        s.id(),
 		MailboxID: mailboxID,
-		From:      msg.From,
-		To:        msg.To,
-		Subject:   msg.Subject,
-		Body:      msg.Body,
+		From:      p.From,
+		To:        p.To,
+		Cc:        p.Cc,
+		Subject:   p.Subject,
+		Body:      p.Body,
+		Raw:       p.Raw,
+		MessageID: p.MessageID,
+		InReplyTo: p.InReplyTo,
 		Flags:     append([]string(nil), flags...),
 		Date:      time.Now(),
-		Size:      len(msg.Body),
+		Size:      p.Size,
 	}
 	s.mu.emails[e.ID] = e
 	return cloneEmail(e), nil
@@ -224,8 +236,14 @@ func (s *Store) List(_ context.Context, mailboxID int64) ([]models.Email, error)
 			if e.To != nil {
 				c.To = append([]string(nil), e.To...)
 			}
+			if e.Cc != nil {
+				c.Cc = append([]string(nil), e.Cc...)
+			}
 			if e.Flags != nil {
 				c.Flags = append([]string(nil), e.Flags...)
+			}
+			if e.Raw != nil {
+				c.Raw = append([]byte(nil), e.Raw...)
 			}
 			out = append(out, c)
 		}
@@ -242,6 +260,39 @@ func (s *Store) SetFlags(_ context.Context, emailID int64, flags []string) error
 	defer s.mu.Unlock()
 	if e, ok := s.mu.emails[emailID]; ok {
 		e.Flags = append([]string(nil), flags...)
+	}
+	return nil
+}
+
+func (s *Store) Search(_ context.Context, mailboxID int64, criteria mailbox.SearchCriteria) ([]int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var ids []int64
+	for _, e := range s.mu.emails {
+		if e.MailboxID != mailboxID {
+			continue
+		}
+		if mailbox.Match(*e, criteria) {
+			ids = append(ids, e.ID)
+		}
+	}
+	return ids, nil
+}
+
+func (s *Store) UpdateFlags(_ context.Context, mailboxID int64, ids []int64, op mailbox.FlagOperation, flags []string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	want := make(map[int64]bool, len(ids))
+	for _, id := range ids {
+		want[id] = true
+	}
+	for _, e := range s.mu.emails {
+		if e.MailboxID != mailboxID || !want[e.ID] {
+			continue
+		}
+		e.Flags = mailbox.ApplyFlags(e.Flags, op, flags)
 	}
 	return nil
 }
@@ -282,6 +333,15 @@ func (s *Store) Copy(_ context.Context, srcMailboxID int64, ids []int64, destMai
 		copy.ID = s.id()
 		copy.MailboxID = destMailboxID
 		copy.Flags = append([]string(nil), e.Flags...)
+		if e.To != nil {
+			copy.To = append([]string(nil), e.To...)
+		}
+		if e.Cc != nil {
+			copy.Cc = append([]string(nil), e.Cc...)
+		}
+		if e.Raw != nil {
+			copy.Raw = append([]byte(nil), e.Raw...)
+		}
 		copy.Date = time.Now()
 		s.mu.emails[copy.ID] = &copy
 	}
