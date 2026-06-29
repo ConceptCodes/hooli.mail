@@ -33,12 +33,17 @@ func New(ctx context.Context, connString string) (*Store, error) {
 		return nil, fmt.Errorf("create pool: %w", err)
 	}
 
+	// If Ping or RunMigrations fail, close the pool so we don't leak
+	// connections. Previously a failing Ping left the pool open because
+	// store.Close() was never wired up.
 	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
 		return nil, fmt.Errorf("ping: %w", err)
 	}
 
 	s := &Store{pool: pool}
 	if err := RunMigrations(ctx, pool); err != nil {
+		pool.Close()
 		return nil, fmt.Errorf("run migrations: %w", err)
 	}
 
@@ -49,9 +54,22 @@ func (s *Store) Close() {
 	s.pool.Close()
 }
 
+// CreateUser inserts the user and seeds the DefaultMailboxes inside a single
+// transaction. If any mailbox insert fails the whole transaction rolls back,
+// so we never persist a half-created account (e.g. an INBOX-less user that
+// every later delivery would crash on).
 func (s *Store) CreateUser(ctx context.Context, email, passwordHash string) (*models.User, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("create user begin: %w", err)
+	}
+	// pgx's deferred Rollback returns ErrTxClosed after a successful Commit;
+	// that's expected and not an error we want to surface. We still need the
+	// defer to run on every return path that doesn't reach Commit.
+	defer func() { _ = tx.Rollback(ctx) }()
+
 	var u models.User
-	err := s.pool.QueryRow(ctx,
+	err = tx.QueryRow(ctx,
 		`INSERT INTO users (email, password_hash) VALUES ($1, $2)
 		 RETURNING id, email, password_hash, created_at`,
 		email, passwordHash,
@@ -61,9 +79,16 @@ func (s *Store) CreateUser(ctx context.Context, email, passwordHash string) (*mo
 	}
 
 	for _, mb := range models.DefaultMailboxes {
-		if _, err := s.CreateMailbox(ctx, u.ID, mb); err != nil {
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO mailboxes (user_id, name) VALUES ($1, $2)`,
+			u.ID, mb,
+		); err != nil {
 			return nil, fmt.Errorf("create mailbox %s: %w", mb, err)
 		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("create user commit: %w", err)
 	}
 
 	return &u, nil
@@ -114,6 +139,12 @@ func (s *Store) GetMailboxes(ctx context.Context, userID int64) ([]models.Mailbo
 			return nil, fmt.Errorf("scan mailbox: %w", err)
 		}
 		mailboxes = append(mailboxes, mb)
+	}
+	// rows.Err surfaces the error that ended the iterator (network blip,
+	// context cancellation). Without it a truncated result set looks like a
+	// successful shorter one.
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate mailboxes: %w", err)
 	}
 	return mailboxes, nil
 }
@@ -236,6 +267,12 @@ func (s *Store) List(ctx context.Context, mailboxID int64) ([]models.Email, erro
 		e.SeqNum = seqNum
 		emails = append(emails, e)
 	}
+	// rows.Err catches the iterator's terminal error (ctx cancellation,
+	// connection loss). Without it a partial list looks like a successful
+	// short result.
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate emails: %w", err)
+	}
 	return emails, nil
 }
 
@@ -276,7 +313,8 @@ func (s *Store) Copy(ctx context.Context, srcMailboxID int64, ids []int64, destM
 	if err != nil {
 		return fmt.Errorf("copy begin: %w", err)
 	}
-	defer tx.Rollback(ctx)
+	// See CreateUser for why Rollback is deferred inside a closure.
+	defer func() { _ = tx.Rollback(ctx) }()
 
 	rows, err := tx.Query(ctx,
 		`SELECT from_address, to_addresses, subject, body, flags
