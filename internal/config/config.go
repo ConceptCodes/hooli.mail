@@ -33,20 +33,20 @@ type PaletteConfig struct {
 func Default() Config {
 	return Config{
 		Theme: ThemeConfig{
-		Dark: PaletteConfig{
-			Ink:   "#ebebeb",
-			Dim:   "#999999",
-			Faint: "#555555",
-			Seal:  "#e58e3c",
-			Error: "#e04f5f",
-		},
-		Light: PaletteConfig{
-			Ink:   "#1a1a1a",
-			Dim:   "#555555",
-			Faint: "#999999",
-			Seal:  "#c05a10",
-			Error: "#b91c1c",
-		},
+			Dark: PaletteConfig{
+				Ink:   "#ebebeb",
+				Dim:   "#999999",
+				Faint: "#555555",
+				Seal:  "#e58e3c",
+				Error: "#e04f5f",
+			},
+			Light: PaletteConfig{
+				Ink:   "#1a1a1a",
+				Dim:   "#555555",
+				Faint: "#999999",
+				Seal:  "#c05a10",
+				Error: "#b91c1c",
+			},
 		},
 		DateFormat:  "absolute",
 		PollSeconds: 0,
@@ -104,7 +104,7 @@ func Ensure() (Config, error) {
 
 	cfg, err := mergeDefaults(data)
 	if err != nil {
-		return cfg, nil
+		return cfg, err
 	}
 	return cfg, nil
 }
