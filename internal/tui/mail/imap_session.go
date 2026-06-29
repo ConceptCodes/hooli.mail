@@ -17,12 +17,12 @@ import (
 // IMAPSession is the real client adapter: IMAP (143 STARTTLS / 993 TLS) for
 // reading, SMTP submission (587) for sending. It implements Session.
 type IMAPSession struct {
-	server          string
-	insecure        bool
-	submissionPort  string
-	username        string
-	submissionAuth  smtp.Auth
-	client          *imapclient.Client
+	server         string
+	insecure       bool
+	submissionPort string
+	username       string
+	submissionAuth smtp.Auth
+	client         *imapclient.Client
 }
 
 // NewIMAPSession builds a Session backed by go-imap + net/smtp. The submission
@@ -39,7 +39,7 @@ func (s *IMAPSession) Login(ctx context.Context, username, password string) ([]S
 
 	if err := c.Login(username, password); err != nil {
 		c.Logout()
-		return nil, fmt.Errorf("invalid credentials")
+		return nil, fmt.Errorf("invalid credentials: %w", err)
 	}
 
 	s.client = c
@@ -59,7 +59,7 @@ func (s *IMAPSession) Refresh(ctx context.Context) ([]Summary, error) {
 func (s *IMAPSession) loadInbox() ([]Summary, error) {
 	mbox, err := s.client.Select("INBOX", false)
 	if err != nil {
-		return nil, fmt.Errorf("cannot open inbox")
+		return nil, fmt.Errorf("cannot open inbox: %w", err)
 	}
 	if mbox.Messages == 0 {
 		return nil, nil
@@ -79,7 +79,7 @@ func (s *IMAPSession) loadInbox() ([]Summary, error) {
 		summaries = append(summaries, toSummary(msg))
 	}
 	if err := <-done; err != nil {
-		return nil, fmt.Errorf("cannot load inbox")
+		return nil, fmt.Errorf("cannot load inbox: %w", err)
 	}
 	return summaries, nil
 }
@@ -104,7 +104,7 @@ func (s *IMAPSession) Fetch(ctx context.Context, uid uint32) (*Full, error) {
 
 	msg := <-messages
 	if err := <-done; err != nil {
-		return nil, fmt.Errorf("cannot fetch message")
+		return nil, fmt.Errorf("cannot fetch message: %w", err)
 	}
 	if msg == nil {
 		return nil, fmt.Errorf("message not found")
@@ -159,7 +159,7 @@ func (s *IMAPSession) Send(ctx context.Context, out Outgoing) error {
 
 	addr := net.JoinHostPort(s.server, s.submissionPort)
 	if err := smtp.SendMail(addr, s.submissionAuth, s.sender(), strings.Split(to, ","), []byte(msg)); err != nil {
-		return fmt.Errorf("send failed")
+		return fmt.Errorf("send failed: %w", err)
 	}
 	return nil
 }
@@ -178,20 +178,19 @@ func (s *IMAPSession) sender() string {
 }
 
 // dialIMAP tries IMAPS (993), then IMAP (143) + STARTTLS, then (when insecure)
-// plain IMAP. InsecureSkipVerify mirrors the previous client behaviour and
-// should be tightened for production deployment.
+// plain IMAP. When insecure is false, the server certificate is verified
+// against the configured ServerName — no InsecureSkipVerify shortcut.
 func (s *IMAPSession) dialIMAP() (*imapclient.Client, error) {
 	if s.insecure {
 		c, err := imapclient.Dial(net.JoinHostPort(s.server, "143"))
 		if err != nil {
-			return nil, fmt.Errorf("cannot reach %s:143", s.server)
+			return nil, fmt.Errorf("cannot reach %s:143: %w", s.server, err)
 		}
 		return c, nil
 	}
 
 	tlsCfg := &tls.Config{
-		ServerName:         s.server,
-		InsecureSkipVerify: true,
+		ServerName: s.server,
 	}
 
 	if c, err := imapclient.DialTLS(net.JoinHostPort(s.server, "993"), tlsCfg); err == nil {
@@ -259,5 +258,3 @@ func extractBody(msg *imap.Message) string {
 	}
 	return ""
 }
-
-

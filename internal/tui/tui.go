@@ -628,7 +628,7 @@ func (m *model) inboxView() string {
 		dot +
 		m.styles.StatusAccent.Render(fmt.Sprintf("%d", m.total)) +
 		dot +
-		m.styles.Muted.Render("@" + m.loggedInUser)
+		m.styles.Muted.Render("@"+m.loggedInUser)
 	if n := len(m.drafts); n > 0 {
 		noun := "draft"
 		if n > 1 {
