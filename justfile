@@ -7,6 +7,32 @@ goarch := `go env GOARCH`
 # Build both server and TUI
 all: server tui
 
+# Run all CI checks: format, vet, race tests
+ci: fmt-check vet test
+    @echo "All CI checks passed."
+
+# Format every Go file under the project
+fmt:
+    gofmt -w .
+
+# Verify every file is gofmt-clean (CI gate)
+fmt-check:
+    gofmt -l . | tee /tmp/gofmt-issues.txt
+    @test ! -s /tmp/gofmt-issues.txt || (echo "gofmt issues above"; rm -f /tmp/gofmt-issues.txt; exit 1)
+    @rm -f /tmp/gofmt-issues.txt
+
+# Run go vet on the whole module
+vet:
+    go vet ./...
+
+# Run tests with the race detector
+test:
+    go test -race ./...
+
+# Run tests including postgres integration (requires TEST_POSTGRES_DSN)
+test-integration:
+    go test -race ./...
+
 # Build the mail server
 server:
     @echo "Building server for {{goos}}/{{goarch}}..."
