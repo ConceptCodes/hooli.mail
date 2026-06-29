@@ -6,3 +6,5 @@ certs/
 
 AGENTS.MD
 .agents/
+
+secrets/

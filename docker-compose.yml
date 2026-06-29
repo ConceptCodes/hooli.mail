@@ -1,20 +1,36 @@
 services:
   postgres:
-    image: postgres:17-alpine
+    # PIN: replace sha256 placeholder with current digest via:
+    #   docker pull postgres:17-alpine && docker image inspect --format '{{index .RepoDigests 0}}' postgres:17-alpine
+    image: postgres:17-alpine@sha256:PLACEHOLDER_POSTGRES_DIGEST
     environment:
-      POSTGRES_USER: hooli
-      POSTGRES_PASSWORD: hooli
-      POSTGRES_DB: hoolimail
+      POSTGRES_USER: "${POSTGRES_USER:-hoolimail}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}"
+      POSTGRES_DB: "${POSTGRES_DB:-hoolimail}"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U hooli -d hoolimail"]
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-hoolimail} -d $${POSTGRES_DB:-hoolimail}"]
       interval: 5s
       timeout: 5s
       retries: 5
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs:
+      - /tmp
+      - /run
+      - /var/run/postgresql
+    mem_limit: 1g
+    cpus: "1.0"
+    pids_limit: 200
+    networks: [internal]
+    # No ports: published — only reachable within the internal network
 
   mailserver:
-    build: .
+    build:
+      context: .
+      args:
+        GIT_COMMIT: "${GIT_COMMIT:-unknown}"
     ports:
       - "80:80"
       - "143:143"
@@ -24,7 +40,7 @@ services:
     environment:
       DOMAIN: "${DOMAIN:?Set DOMAIN to your mail server hostname}"
       ACME_EMAIL: "${ACME_EMAIL:-admin@${DOMAIN}}"
-      DSN: "postgres://hooli:hooli@postgres:5432/hoolimail?sslmode=disable"
+      DSN: "postgres://${POSTGRES_USER:-hoolimail}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-hoolimail}?sslmode=prefer"
       SEED_EMAIL: "${SEED_EMAIL}"
       SEED_PASS: "${SEED_PASS}"
     volumes:
@@ -32,6 +48,31 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, SETUID, SETGID, NET_BIND_SERVICE]
+    security_opt: ["no-new-privileges:true"]
+    read_only: true
+    tmpfs:
+      - /tmp
+    mem_limit: 512m
+    memswap_limit: 1g
+    cpus: "1.5"
+    pids_limit: 200
+    ulimits:
+      nofile:
+        soft: 1024
+        hard: 4096
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 ${IMAP_PORT:-143} || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks: [internal]
+
+networks:
+  internal:
+    driver: bridge
 
 volumes:
   pgdata:
