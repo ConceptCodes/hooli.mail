@@ -52,6 +52,14 @@ var migrations = []struct {
 		name: "005_create_mailbox_indexes",
 		sql:  `CREATE INDEX IF NOT EXISTS idx_mailboxes_user_id ON mailboxes(user_id)`,
 	},
+	{
+		name: "006_add_canonical_message_columns",
+		sql: `ALTER TABLE emails
+			ADD COLUMN IF NOT EXISTS raw_message BYTEA,
+			ADD COLUMN IF NOT EXISTS cc_addresses TEXT[] NOT NULL DEFAULT '{}',
+			ADD COLUMN IF NOT EXISTS message_id TEXT NOT NULL DEFAULT '',
+			ADD COLUMN IF NOT EXISTS in_reply_to TEXT NOT NULL DEFAULT ''`,
+	},
 }
 
 func RunMigrations(ctx context.Context, pool *pgxpool.Pool) error {

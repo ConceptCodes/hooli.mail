@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 
+	"hooli.mail/server/internal/mailbox"
 	"hooli.mail/server/internal/mailstore"
 	"hooli.mail/server/internal/models"
 
@@ -222,21 +223,24 @@ func (s *Store) Status(ctx context.Context, mailboxID int64) (mailstore.Status, 
 }
 
 // Append stores a Message. Empty Flags default to [\Recent], matching the
-// delivery path; IMAP APPEND passes through the caller's flags.
+// delivery path; IMAP APPEND passes through the caller's flags. Raw message
+// bytes are stored alongside derived metadata so IMAP BODY[] and RFC822.SIZE
+// are faithful to what was received. Size is len(Raw), not len(Body).
 func (s *Store) Append(ctx context.Context, mailboxID int64, msg mailstore.Message) (*models.Email, error) {
 	flags := msg.Flags
 	if len(flags) == 0 {
 		flags = []string{models.FlagRecent}
 	}
-	size := len(msg.Body)
+	p := msg.Parsed
+	size := p.Size
 
 	var e models.Email
 	err := s.pool.QueryRow(ctx,
-		`INSERT INTO emails (mailbox_id, from_address, to_addresses, subject, body, flags, size)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7)
-		 RETURNING id, mailbox_id, from_address, to_addresses, subject, body, flags, date, size`,
-		mailboxID, msg.From, msg.To, msg.Subject, msg.Body, flags, size,
-	).Scan(&e.ID, &e.MailboxID, &e.From, &e.To, &e.Subject, &e.Body, &e.Flags, &e.Date, &e.Size)
+		`INSERT INTO emails (mailbox_id, from_address, to_addresses, cc_addresses, subject, body, raw_message, message_id, in_reply_to, flags, size)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+		 RETURNING id, mailbox_id, from_address, to_addresses, cc_addresses, subject, body, raw_message, message_id, in_reply_to, flags, date, size`,
+		mailboxID, p.From, p.To, p.Cc, p.Subject, p.Body, p.Raw, p.MessageID, p.InReplyTo, flags, size,
+	).Scan(&e.ID, &e.MailboxID, &e.From, &e.To, &e.Cc, &e.Subject, &e.Body, &e.Raw, &e.MessageID, &e.InReplyTo, &e.Flags, &e.Date, &e.Size)
 	if err != nil {
 		return nil, fmt.Errorf("append email: %w", err)
 	}
@@ -247,7 +251,7 @@ func (s *Store) Append(ctx context.Context, mailboxID int64, msg mailstore.Messa
 // assigned in that order (1 = newest).
 func (s *Store) List(ctx context.Context, mailboxID int64) ([]models.Email, error) {
 	rows, err := s.pool.Query(ctx,
-		`SELECT id, mailbox_id, from_address, to_addresses, subject, body, flags, date, size
+		`SELECT id, mailbox_id, from_address, to_addresses, cc_addresses, subject, body, raw_message, message_id, in_reply_to, flags, date, size
 		 FROM emails WHERE mailbox_id = $1 ORDER BY date DESC`,
 		mailboxID,
 	)
@@ -261,7 +265,7 @@ func (s *Store) List(ctx context.Context, mailboxID int64) ([]models.Email, erro
 	for rows.Next() {
 		seqNum++
 		var e models.Email
-		if err := rows.Scan(&e.ID, &e.MailboxID, &e.From, &e.To, &e.Subject, &e.Body, &e.Flags, &e.Date, &e.Size); err != nil {
+		if err := rows.Scan(&e.ID, &e.MailboxID, &e.From, &e.To, &e.Cc, &e.Subject, &e.Body, &e.Raw, &e.MessageID, &e.InReplyTo, &e.Flags, &e.Date, &e.Size); err != nil {
 			return nil, fmt.Errorf("scan email: %w", err)
 		}
 		e.SeqNum = seqNum
@@ -282,6 +286,89 @@ func (s *Store) SetFlags(ctx context.Context, emailID int64, flags []string) err
 		flags, emailID,
 	); err != nil {
 		return fmt.Errorf("set flags: %w", err)
+	}
+	return nil
+}
+
+// Search evaluates the criteria in Go using mailbox.Match. This keeps the
+// semantic logic in one place (the mailbox package) rather than splitting it
+// between SQL and Go. The query loads only the columns Match needs.
+func (s *Store) Search(ctx context.Context, mailboxID int64, criteria mailbox.SearchCriteria) ([]int64, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT id, from_address, to_addresses, cc_addresses, subject, body, flags, date, size
+		 FROM emails WHERE mailbox_id = $1`,
+		mailboxID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("search emails: %w", err)
+	}
+	defer rows.Close()
+
+	var ids []int64
+	for rows.Next() {
+		var e models.Email
+		e.MailboxID = mailboxID
+		if err := rows.Scan(&e.ID, &e.From, &e.To, &e.Cc, &e.Subject, &e.Body, &e.Flags, &e.Date, &e.Size); err != nil {
+			return nil, fmt.Errorf("search scan: %w", err)
+		}
+		if mailbox.Match(e, criteria) {
+			ids = append(ids, e.ID)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("search rows: %w", err)
+	}
+	return ids, nil
+}
+
+// UpdateFlags applies a flag operation to multiple messages in one transaction.
+// Each message's current flags are read, mailbox.ApplyFlags computes the new
+// set, and the result is written back. The transaction ensures that a partial
+// failure leaves no message half-updated.
+func (s *Store) UpdateFlags(ctx context.Context, mailboxID int64, ids []int64, op mailbox.FlagOperation, flags []string) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("update flags begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	rows, err := tx.Query(ctx,
+		`SELECT id, flags FROM emails WHERE mailbox_id = $1 AND id = ANY($2)`,
+		mailboxID, ids,
+	)
+	if err != nil {
+		return fmt.Errorf("update flags select: %w", err)
+	}
+	defer rows.Close()
+
+	type entry struct {
+		id       int64
+		oldFlags []string
+	}
+	var entries []entry
+	for rows.Next() {
+		var e entry
+		if err := rows.Scan(&e.id, &e.oldFlags); err != nil {
+			return fmt.Errorf("update flags scan: %w", err)
+		}
+		entries = append(entries, e)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("update flags rows: %w", err)
+	}
+
+	for _, e := range entries {
+		newFlags := mailbox.ApplyFlags(e.oldFlags, op, flags)
+		if _, err := tx.Exec(ctx,
+			`UPDATE emails SET flags = $1 WHERE id = $2`,
+			newFlags, e.id,
+		); err != nil {
+			return fmt.Errorf("update flags write: %w", err)
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("update flags commit: %w", err)
 	}
 	return nil
 }
@@ -317,7 +404,7 @@ func (s *Store) Copy(ctx context.Context, srcMailboxID int64, ids []int64, destM
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	rows, err := tx.Query(ctx,
-		`SELECT from_address, to_addresses, subject, body, flags
+		`SELECT from_address, to_addresses, cc_addresses, subject, body, raw_message, message_id, in_reply_to, flags, size
 		 FROM emails WHERE mailbox_id = $1 AND id = ANY($2)`,
 		srcMailboxID, ids,
 	)
@@ -327,13 +414,15 @@ func (s *Store) Copy(ctx context.Context, srcMailboxID int64, ids []int64, destM
 	defer rows.Close()
 
 	type src struct {
-		from, subject, body string
-		to, flags           []string
+		from, subject, body, messageID, inReplyTo string
+		to, cc, flags                             []string
+		raw                                       []byte
+		size                                      int
 	}
 	var msgs []src
 	for rows.Next() {
 		var m src
-		if err := rows.Scan(&m.from, &m.to, &m.subject, &m.body, &m.flags); err != nil {
+		if err := rows.Scan(&m.from, &m.to, &m.cc, &m.subject, &m.body, &m.raw, &m.messageID, &m.inReplyTo, &m.flags, &m.size); err != nil {
 			return fmt.Errorf("copy scan: %w", err)
 		}
 		msgs = append(msgs, m)
@@ -343,11 +432,10 @@ func (s *Store) Copy(ctx context.Context, srcMailboxID int64, ids []int64, destM
 	}
 
 	for _, m := range msgs {
-		size := len(m.body)
 		if _, err := tx.Exec(ctx,
-			`INSERT INTO emails (mailbox_id, from_address, to_addresses, subject, body, flags, size)
-			 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-			destMailboxID, m.from, m.to, m.subject, m.body, m.flags, size,
+			`INSERT INTO emails (mailbox_id, from_address, to_addresses, cc_addresses, subject, body, raw_message, message_id, in_reply_to, flags, size)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+			destMailboxID, m.from, m.to, m.cc, m.subject, m.body, m.raw, m.messageID, m.inReplyTo, m.flags, m.size,
 		); err != nil {
 			return fmt.Errorf("copy insert: %w", err)
 		}

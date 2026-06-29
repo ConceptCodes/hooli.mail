@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"os"
+	"strings"
 	"testing"
 
 	"hooli.mail/server/internal/mailstore"
+	"hooli.mail/server/internal/message"
 	"hooli.mail/server/internal/models"
 
 	"github.com/jackc/pgx/v5"
@@ -49,7 +51,13 @@ func TestSetFlagsReturnsNilOnSuccess(t *testing.T) {
 		t.Fatalf("inbox: %v mb=%v", err, mb)
 	}
 	email, err := s.Append(ctx, mb.ID, mailstore.Message{
-		From: "x@h", To: []string{"flags-test@hooli.test"}, Subject: "s", Body: "b",
+		Parsed: message.Parse([]byte(strings.Join([]string{
+			"From: x@h",
+			"To: flags-test@hooli.test",
+			"Subject: s",
+			"",
+			"b",
+		}, "\r\n"))),
 	})
 	if err != nil {
 		t.Fatalf("append: %v", err)
@@ -92,7 +100,13 @@ func TestDeleteMessageReturnsNilOnSuccess(t *testing.T) {
 	}
 	mb, _ := s.GetMailboxByName(ctx, u.ID, "INBOX")
 	email, err := s.Append(ctx, mb.ID, mailstore.Message{
-		From: "x@h", To: []string{"del-test@hooli.test"}, Subject: "s", Body: "b",
+		Parsed: message.Parse([]byte(strings.Join([]string{
+			"From: x@h",
+			"To: del-test@hooli.test",
+			"Subject: s",
+			"",
+			"b",
+		}, "\r\n"))),
 	})
 	if err != nil {
 		t.Fatalf("append: %v", err)
