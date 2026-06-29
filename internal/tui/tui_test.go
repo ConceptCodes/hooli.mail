@@ -8,6 +8,8 @@ import (
 
 	"hooli.mail/server/internal/config"
 	"hooli.mail/server/internal/tui/mail"
+
+	tea "github.com/charmbracelet/bubbletea"
 )
 
 // fakeSession is the test adapter behind the seam: it returns canned data so
@@ -161,6 +163,8 @@ func TestSendMailInvokesSession(t *testing.T) {
 	m := newTestModel(t, fake)
 	m.username = "me@x.com"
 	m.composeTo.SetValue("you@x.com")
+	m.composeCc.SetValue("cc@x.com")
+	m.composeBcc.SetValue("bcc@x.com")
 	m.composeSubject.SetValue("hey")
 	m.composeBody = "body text"
 
@@ -174,5 +178,125 @@ func TestSendMailInvokesSession(t *testing.T) {
 	}
 	if fake.sent.To != "you@x.com" || fake.sent.Body != "body text" {
 		t.Errorf("sent = %+v", fake.sent)
+	}
+	if fake.sent.Cc != "cc@x.com" {
+		t.Errorf("Cc = %q, want cc@x.com", fake.sent.Cc)
+	}
+	if fake.sent.Bcc != "bcc@x.com" {
+		t.Errorf("Bcc = %q, want bcc@x.com", fake.sent.Bcc)
+	}
+}
+
+// TestComposeFieldCycle verifies tab navigates through all five fields
+// (To → Cc → Bcc → Subject → Body) and wraps back to To.
+func TestComposeFieldCycle(t *testing.T) {
+	m := newTestModel(t, &fakeSession{})
+	m.state = composeView
+	m.composeCursor = 0
+	m.composeTo.Focus()
+
+	// To → Cc
+	m.advanceComposeField()
+	if m.composeCursor != 1 {
+		t.Fatalf("after To tab: cursor = %d, want 1", m.composeCursor)
+	}
+	// Cc → Bcc
+	m.advanceComposeField()
+	if m.composeCursor != 2 {
+		t.Fatalf("after Cc tab: cursor = %d, want 2", m.composeCursor)
+	}
+	// Bcc → Subject
+	m.advanceComposeField()
+	if m.composeCursor != 3 {
+		t.Fatalf("after Bcc tab: cursor = %d, want 3", m.composeCursor)
+	}
+	// Subject → Body
+	m.advanceComposeField()
+	if m.composeCursor != 4 {
+		t.Fatalf("after Subject tab: cursor = %d, want 4", m.composeCursor)
+	}
+	// Body → To (wrap)
+	m.advanceComposeField()
+	if m.composeCursor != 0 {
+		t.Fatalf("after Body tab: cursor = %d, want 0 (wrap)", m.composeCursor)
+	}
+}
+
+// TestComposeRetreatCycle verifies shift+tab goes backwards through fields.
+func TestComposeRetreatCycle(t *testing.T) {
+	m := newTestModel(t, &fakeSession{})
+	m.state = composeView
+	m.composeCursor = 0
+
+	// To → Body (wrap backwards)
+	m.retreatComposeField()
+	if m.composeCursor != 4 {
+		t.Fatalf("retreat from To: cursor = %d, want 4 (wrap)", m.composeCursor)
+	}
+	// Body → Subject
+	m.retreatComposeField()
+	if m.composeCursor != 3 {
+		t.Fatalf("retreat from Body: cursor = %d, want 3", m.composeCursor)
+	}
+}
+
+// TestDraftPreservesCcBcc verifies that saving a draft with Cc/Bcc and
+// resuming it restores all fields.
+func TestDraftPreservesCcBcc(t *testing.T) {
+	m := newTestModel(t, &fakeSession{})
+	m.state = draftConfirmView
+	m.composeTo.SetValue("to@x.com")
+	m.composeCc.SetValue("cc@x.com")
+	m.composeBcc.SetValue("bcc@x.com")
+	m.composeSubject.SetValue("subj")
+	m.composeBody = "body"
+
+	// Save draft
+	mm, _ := m.Update(runeKey("s"))
+	m = mm.(*model)
+	if len(m.drafts) != 1 {
+		t.Fatalf("expected 1 draft, got %d", len(m.drafts))
+	}
+	d := m.drafts[0]
+	if d.Cc != "cc@x.com" || d.Bcc != "bcc@x.com" {
+		t.Errorf("draft Cc=%q Bcc=%q", d.Cc, d.Bcc)
+	}
+
+	// Resume the draft
+	m.state = draftsView
+	m.draftsCursor = 0
+	mm, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = mm.(*model)
+	if m.state != composeView {
+		t.Fatalf("expected composeView, got %v", m.state)
+	}
+	if m.composeCc.Value() != "cc@x.com" {
+		t.Errorf("restored Cc = %q", m.composeCc.Value())
+	}
+	if m.composeBcc.Value() != "bcc@x.com" {
+		t.Errorf("restored Bcc = %q", m.composeBcc.Value())
+	}
+}
+
+// TestNewComposeClearsCcBcc verifies that pressing "c" for a new compose
+// starts with empty Cc/Bcc fields.
+func TestNewComposeClearsCcBcc(t *testing.T) {
+	m := newTestModel(t, &fakeSession{})
+	m.state = inboxView
+	m.loggedInUser = "me@x.com"
+	// Simulate leftover values from a previous compose
+	m.composeCc.SetValue("old@x.com")
+	m.composeBcc.SetValue("old-bcc@x.com")
+
+	mm, _ := m.Update(runeKey("c"))
+	m = mm.(*model)
+	if m.state != composeView {
+		t.Fatalf("expected composeView, got %v", m.state)
+	}
+	if m.composeCc.Value() != "" {
+		t.Errorf("Cc not cleared: %q", m.composeCc.Value())
+	}
+	if m.composeBcc.Value() != "" {
+		t.Errorf("Bcc not cleared: %q", m.composeBcc.Value())
 	}
 }
