@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -10,7 +11,9 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
+	"time"
 
 	"golang.org/x/crypto/acme/autocert"
 
@@ -62,11 +65,12 @@ func main() {
 	}
 
 	var tlsConfig *tls.Config
+	var acmeMgr *autocert.Manager
 
 	if *domain != "" {
 		log.Printf("Domain: %s — provisioning Let's Encrypt certificates", *domain)
 
-		m := &autocert.Manager{
+		acmeMgr = &autocert.Manager{
 			Cache:  autocert.DirCache("certs"),
 			Prompt: autocert.AcceptTOS,
 			HostPolicy: func(_ context.Context, host string) error {
@@ -77,23 +81,16 @@ func main() {
 			},
 		}
 		if *acmeEmail != "" {
-			m.Email = *acmeEmail
+			acmeMgr.Email = *acmeEmail
 		}
 
-		go func() {
-			log.Println("Starting ACME HTTP challenge server on :80")
-			if err := http.ListenAndServe(":80", m.HTTPHandler(nil)); err != nil {
-				log.Fatalf("ACME HTTP server: %v", err)
-			}
-		}()
-
 		tlsConfig = &tls.Config{
-			GetCertificate:           m.GetCertificate,
+			GetCertificate:           acmeMgr.GetCertificate,
 			MinVersion:               tls.VersionTLS12,
 			PreferServerCipherSuites: true,
 		}
 	} else {
-		log.Println("No domain set — running without TLS")
+		log.Println("No domain set — running without TLS (dev mode)")
 	}
 
 	sigCh := make(chan os.Signal, 1)
@@ -101,12 +98,12 @@ func main() {
 
 	authn := auth.NewAuthenticator(store)
 
-	smtpReceiving := smtp.NewServer(store, authn, ":"+*smtpPort, nil, false)
-	smtpSubmission := smtp.NewServer(store, authn, ":"+*submissionPort, tlsConfig, true)
-	imapStartTLS := imap.NewServer(store, authn, ":"+*imapPort, tlsConfig)
-	imapTLS := imap.NewServer(store, authn, ":"+*imapsPort, tlsConfig)
+	smtpReceiving := smtp.NewServer(store, authn, ":"+*smtpPort, nil, false, ctx)
+	smtpSubmission := smtp.NewServer(store, authn, ":"+*submissionPort, tlsConfig, true, ctx)
+	imapStartTLS := imap.NewServer(store, authn, ":"+*imapPort, tlsConfig, ctx)
+	imapTLS := imap.NewServer(store, authn, ":"+*imapsPort, tlsConfig, ctx)
 
-	start := []struct {
+	starters := []struct {
 		Name string
 		Run  func() error
 	}{
@@ -116,25 +113,75 @@ func main() {
 		{"IMAPS :" + *imapsPort, imapTLS.Start},
 	}
 
-	for _, s := range start {
-		s := s
+	// errCh collects fatal errors from goroutines without ever calling
+	// os.Exit from a goroutine (which would skip deferred cleanup).
+	errCh := make(chan error, len(starters)+1)
+	var wg sync.WaitGroup
+
+	run := func(name string, fn func() error) {
+		defer wg.Done()
+		log.Printf("Starting %s...", name)
+		if err := fn(); err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
+			errCh <- fmt.Errorf("%s: %w", name, err)
+		}
+	}
+
+	if tlsConfig != nil {
+		wg.Add(1)
 		go func() {
-			log.Printf("Starting %s...", s.Name)
-			if err := s.Run(); err != nil {
-				if isClosedNetErr(err) {
+			defer wg.Done()
+			log.Println("Starting ACME HTTP challenge server on :80")
+			if err := http.ListenAndServe(":80", acmeMgr.HTTPHandler(nil)); err != nil {
+				if errors.Is(err, net.ErrClosed) || errors.Is(err, http.ErrServerClosed) {
 					return
 				}
-				log.Fatalf("%s: %v", s.Name, err)
+				errCh <- fmt.Errorf("ACME HTTP server: %w", err)
 			}
 		}()
 	}
 
-	<-sigCh
-	log.Println("Shutting down...")
+	for _, s := range starters {
+		wg.Add(1)
+		go run(s.Name, s.Run)
+	}
+
+	// Wait for either a signal or a fatal server error. Either way, we then
+	// tear everything down and let deferred store.Close() run on the way out.
+	var shutdownErr error
+	select {
+	case <-sigCh:
+		log.Println("Shutting down...")
+	case err := <-errCh:
+		log.Printf("Fatal: %v", err)
+		shutdownErr = err
+	}
+
 	smtpReceiving.Stop()
 	smtpSubmission.Stop()
 	imapStartTLS.Stop()
 	imapTLS.Stop()
+	cancel()
+
+	// Give in-flight goroutines a chance to return, then bail. We don't wait
+	// forever — protocol sessions stuck mid-DB-call will be cancelled by the
+	// context already, so a brief wait is enough.
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		log.Println("Shutdown: some goroutines did not exit within 5s")
+	}
+
+	if shutdownErr != nil {
+		os.Exit(1)
+	}
 }
 
 func envOrDefault(key, def string) string {
@@ -142,14 +189,4 @@ func envOrDefault(key, def string) string {
 		return v
 	}
 	return def
-}
-
-func isClosedNetErr(err error) bool {
-	if err == nil {
-		return false
-	}
-	if ne, ok := err.(*net.OpError); ok {
-		return ne.Err.Error() == "use of closed network connection"
-	}
-	return false
 }
