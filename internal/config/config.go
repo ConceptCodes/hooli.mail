@@ -24,7 +24,8 @@ type ThemeConfig struct {
 
 type PaletteConfig struct {
 	Ink   string `json:"ink"`
-	Faint string `json:"faint"`
+	Dim   string `json:"dim"`   // secondary text — between ink and faint
+	Faint string `json:"faint"` // muted text — hints, labels, separators
 	Seal  string `json:"seal"`
 	Error string `json:"error"`
 }
@@ -32,18 +33,20 @@ type PaletteConfig struct {
 func Default() Config {
 	return Config{
 		Theme: ThemeConfig{
-			Dark: PaletteConfig{
-				Ink:   "#ebebeb",
-				Faint: "#666666",
-				Seal:  "#e58e3c",
-				Error: "#e04f5f",
-			},
-			Light: PaletteConfig{
-				Ink:   "#000000",
-				Faint: "#888888",
-				Seal:  "#c05a10",
-				Error: "#b91c1c",
-			},
+		Dark: PaletteConfig{
+			Ink:   "#ebebeb",
+			Dim:   "#999999",
+			Faint: "#555555",
+			Seal:  "#e58e3c",
+			Error: "#e04f5f",
+		},
+		Light: PaletteConfig{
+			Ink:   "#1a1a1a",
+			Dim:   "#555555",
+			Faint: "#999999",
+			Seal:  "#c05a10",
+			Error: "#b91c1c",
+		},
 		},
 		DateFormat:  "absolute",
 		PollSeconds: 0,
@@ -135,6 +138,9 @@ func mergeDefaults(data []byte) (Config, error) {
 	if partial.Theme.Dark.Ink != "" {
 		cfg.Theme.Dark.Ink = partial.Theme.Dark.Ink
 	}
+	if partial.Theme.Dark.Dim != "" {
+		cfg.Theme.Dark.Dim = partial.Theme.Dark.Dim
+	}
 	if partial.Theme.Dark.Faint != "" {
 		cfg.Theme.Dark.Faint = partial.Theme.Dark.Faint
 	}
@@ -146,6 +152,9 @@ func mergeDefaults(data []byte) (Config, error) {
 	}
 	if partial.Theme.Light.Ink != "" {
 		cfg.Theme.Light.Ink = partial.Theme.Light.Ink
+	}
+	if partial.Theme.Light.Dim != "" {
+		cfg.Theme.Light.Dim = partial.Theme.Light.Dim
 	}
 	if partial.Theme.Light.Faint != "" {
 		cfg.Theme.Light.Faint = partial.Theme.Light.Faint

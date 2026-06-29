@@ -1,22 +1,24 @@
 {
   "theme": {
     "dark": {
-      "ink": "#ebebeb",
-      "faint": "#666666",
-      "seal": "#e58e3c",
+      "ink":   "#ebebeb",
+      "dim":   "#999999",
+      "faint": "#555555",
+      "seal":  "#e58e3c",
       "error": "#e04f5f"
     },
     "light": {
-      "ink": "#000000",
-      "faint": "#888888",
-      "seal": "#c05a10",
+      "ink":   "#1a1a1a",
+      "dim":   "#555555",
+      "faint": "#999999",
+      "seal":  "#c05a10",
       "error": "#b91c1c"
     }
   },
-  "server": "mail.example.com",
-  "insecure": false,
-  "date_format": "relative",
-  "signature": "\n--\nSent from Hooli Mail",
+  "server":       "mail.example.com",
+  "insecure":     false,
+  "date_format":  "relative",
+  "signature":    "\n--\nSent from Hooli Mail",
   "poll_seconds": 30,
-  "page_size": 50
+  "page_size":    50
 }
