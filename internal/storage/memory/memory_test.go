@@ -145,3 +145,74 @@ func TestAppendDefaultsToRecent(t *testing.T) {
 		t.Fatalf("default flags = %v, want [\\Recent]", e.Flags)
 	}
 }
+
+// TestAppendDoesNotLeakInternalPointer pins the fix for the memory store
+// returning internal pointers: callers previously held a *models.Email that
+// aliased the store's own record, so a mutation outside the mutex was a data
+// race. Now every getter returns a deep copy — mutating the returned value
+// must not affect a subsequent read.
+func TestAppendDoesNotLeakInternalPointer(t *testing.T) {
+	s := New()
+	u := newTestUser(t, s)
+	mb := inboxOf(t, s, u.ID)
+
+	stored := appendMsg(t, s, mb.ID, []string{models.FlagSeen})
+	stored.Flags[0] = "MUTATED"
+	stored.To = append(stored.To, "injected@evil.com")
+	stored.Body = "tampered"
+
+	got, err := s.List(context.Background(), mb.ID)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d, want 1", len(got))
+	}
+	if hasFlag(got[0].Flags, "MUTATED") {
+		t.Errorf("Flags mutation leaked: %v", got[0].Flags)
+	}
+	if hasStr(got[0].To, "injected@evil.com") {
+		t.Errorf("To mutation leaked: %v", got[0].To)
+	}
+	if got[0].Body == "tampered" {
+		t.Errorf("Body mutation leaked: %q", got[0].Body)
+	}
+}
+
+// TestGetUserByEmailDoesNotLeakInternalPointer pins the same fix for the user
+// getters — mutating the returned *models.User must not affect subsequent
+// reads.
+func TestGetUserByEmailDoesNotLeakInternalPointer(t *testing.T) {
+	s := New()
+	u := newTestUser(t, s)
+
+	got, err := s.GetUserByEmail(context.Background(), u.Email)
+	if err != nil || got == nil {
+		t.Fatalf("GetUserByEmail: %v %v", err, got)
+	}
+	got.Email = "mutated@x.com"
+	got.PasswordHash = "tampered"
+
+	again, err := s.GetUserByEmail(context.Background(), "user@x.com")
+	if err != nil {
+		t.Fatalf("GetUserByEmail second call: %v", err)
+	}
+	if again == nil {
+		t.Fatal("original user vanished after mutating returned copy — pointer leak")
+	}
+	if again.Email != "user@x.com" {
+		t.Errorf("Email leaked mutation: %q", again.Email)
+	}
+	if again.PasswordHash != "hash" {
+		t.Errorf("PasswordHash leaked mutation: %q", again.PasswordHash)
+	}
+}
+
+func hasStr(slice []string, want string) bool {
+	for _, s := range slice {
+		if s == want {
+			return true
+		}
+	}
+	return false
+}

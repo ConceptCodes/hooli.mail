@@ -44,6 +44,40 @@ func (s *Store) id() int64 {
 	return s.nextID
 }
 
+// cloneUser / cloneMailbox / cloneEmail return deep copies so the store never
+// hands out a pointer into its own map. Without these, a caller could mutate
+// a stored record (or its slices) outside the mutex — a data race. Slice
+// fields (To, Flags) are copied element-wise; scalars ride along.
+func cloneUser(u *models.User) *models.User {
+	if u == nil {
+		return nil
+	}
+	c := *u
+	return &c
+}
+
+func cloneMailbox(mb *models.Mailbox) *models.Mailbox {
+	if mb == nil {
+		return nil
+	}
+	c := *mb
+	return &c
+}
+
+func cloneEmail(e *models.Email) *models.Email {
+	if e == nil {
+		return nil
+	}
+	c := *e
+	if e.To != nil {
+		c.To = append([]string(nil), e.To...)
+	}
+	if e.Flags != nil {
+		c.Flags = append([]string(nil), e.Flags...)
+	}
+	return &c
+}
+
 func (s *Store) CreateUser(_ context.Context, email, passwordHash string) (*models.User, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -61,7 +95,7 @@ func (s *Store) CreateUser(_ context.Context, email, passwordHash string) (*mode
 		mb := &models.Mailbox{ID: s.id(), UserID: u.ID, Name: name, CreatedAt: time.Now()}
 		s.mu.mailboxes[mb.ID] = mb
 	}
-	return u, nil
+	return cloneUser(u), nil
 }
 
 func (s *Store) GetUserByEmail(_ context.Context, email string) (*models.User, error) {
@@ -69,7 +103,7 @@ func (s *Store) GetUserByEmail(_ context.Context, email string) (*models.User, e
 	defer s.mu.Unlock()
 	for _, u := range s.mu.users {
 		if u.Email == email {
-			return u, nil
+			return cloneUser(u), nil
 		}
 	}
 	return nil, nil
@@ -85,7 +119,7 @@ func (s *Store) CreateMailbox(_ context.Context, userID int64, name string) (*mo
 	}
 	mb := &models.Mailbox{ID: s.id(), UserID: userID, Name: name, CreatedAt: time.Now()}
 	s.mu.mailboxes[mb.ID] = mb
-	return mb, nil
+	return cloneMailbox(mb), nil
 }
 
 func (s *Store) GetMailboxes(_ context.Context, userID int64) ([]models.Mailbox, error) {
@@ -94,6 +128,9 @@ func (s *Store) GetMailboxes(_ context.Context, userID int64) ([]models.Mailbox,
 	var out []models.Mailbox
 	for _, mb := range s.mu.mailboxes {
 		if mb.UserID == userID {
+			// mb is a value (range copies the *models.Mailbox pointer), but
+			// the slice still aliases the same struct. The deref below makes
+			// a shallow copy, which is fine — Mailbox has no slice fields.
 			out = append(out, *mb)
 		}
 	}
@@ -106,7 +143,7 @@ func (s *Store) GetMailboxByName(_ context.Context, userID int64, name string) (
 	defer s.mu.Unlock()
 	for _, mb := range s.mu.mailboxes {
 		if mb.UserID == userID && mb.Name == name {
-			return mb, nil
+			return cloneMailbox(mb), nil
 		}
 	}
 	return nil, nil
@@ -173,7 +210,7 @@ func (s *Store) Append(_ context.Context, mailboxID int64, msg mailstore.Message
 		Size:      len(msg.Body),
 	}
 	s.mu.emails[e.ID] = e
-	return e, nil
+	return cloneEmail(e), nil
 }
 
 func (s *Store) List(_ context.Context, mailboxID int64) ([]models.Email, error) {
@@ -183,7 +220,14 @@ func (s *Store) List(_ context.Context, mailboxID int64) ([]models.Email, error)
 	var out []models.Email
 	for _, e := range s.mu.emails {
 		if e.MailboxID == mailboxID {
-			out = append(out, *e)
+			c := *e
+			if e.To != nil {
+				c.To = append([]string(nil), e.To...)
+			}
+			if e.Flags != nil {
+				c.Flags = append([]string(nil), e.Flags...)
+			}
+			out = append(out, c)
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Date.After(out[j].Date) })
