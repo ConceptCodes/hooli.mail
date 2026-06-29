@@ -29,16 +29,15 @@ import (
 type IMAPBackend struct {
 	store mailstore.Store
 	authn *auth.Authenticator
+	ctx   context.Context
 }
 
-func NewBackend(store mailstore.Store, authn *auth.Authenticator) *IMAPBackend {
-	return &IMAPBackend{store: store, authn: authn}
+func NewBackend(store mailstore.Store, authn *auth.Authenticator, ctx context.Context) *IMAPBackend {
+	return &IMAPBackend{store: store, authn: authn, ctx: ctx}
 }
 
 func (b *IMAPBackend) Login(connInfo *imap.ConnInfo, username, password string) (imapbackend.User, error) {
-	ctx := context.Background()
-
-	u, err := b.authn.Verify(ctx, username, password)
+	u, err := b.authn.Verify(b.ctx, username, password)
 	if err != nil {
 		return nil, imapbackend.ErrInvalidCredentials
 	}
@@ -46,7 +45,7 @@ func (b *IMAPBackend) Login(connInfo *imap.ConnInfo, username, password string) 
 	return &IMAPUser{
 		backend: b,
 		user:    u,
-		ctx:     ctx,
+		ctx:     b.ctx,
 	}, nil
 }
 
@@ -234,24 +233,114 @@ func (m *IMAPMailbox) SearchMessages(uid bool, criteria *imap.SearchCriteria) ([
 			id = email.SeqNum
 		}
 
-		if criteria.WithoutFlags != nil {
-			hasFlag := false
-			for _, f := range email.Flags {
-				for _, nf := range criteria.WithoutFlags {
-					if strings.EqualFold(f, string(nf)) {
-						hasFlag = true
-						break
-					}
-				}
-			}
-			if hasFlag {
-				continue
-			}
+		if !m.matchSearch(email, criteria) {
+			continue
 		}
 
 		ids = append(ids, id)
 	}
 	return ids, nil
+}
+
+// matchSearch evaluates the subset of imap.SearchCriteria that we support
+// in-memory: WithFlags / WithoutFlags, Since / Before (internal date),
+// Larger / Smaller (octets), and substring matches on From/To/Subject/Body.
+// Criteria we don't model (SentSince, Not, Or, SeqNum) are treated as "match"
+// so they fail open rather than silently hiding messages.
+func (m *IMAPMailbox) matchSearch(email models.Email, c *imap.SearchCriteria) bool {
+	if !matchFlags(email.Flags, c.WithFlags, c.WithoutFlags) {
+		return false
+	}
+	if !matchDateRange(email.Date, c.Since, c.Before) {
+		return false
+	}
+	if !matchSize(email.Size, c.Larger, c.Smaller) {
+		return false
+	}
+	for _, needle := range c.Body {
+		if !strings.Contains(strings.ToLower(email.Body), strings.ToLower(needle)) {
+			return false
+		}
+	}
+	for _, needle := range c.Text {
+		lower := strings.ToLower(needle)
+		if !strings.Contains(strings.ToLower(email.From), lower) &&
+			!strings.Contains(strings.ToLower(email.Subject), lower) &&
+			!strings.Contains(strings.ToLower(email.Body), lower) &&
+			!containsAny(email.To, lower) {
+			return false
+		}
+	}
+	for header, values := range c.Header {
+		switch strings.ToLower(header) {
+		case "from":
+			for _, v := range values {
+				if !strings.Contains(strings.ToLower(email.From), strings.ToLower(v)) {
+					return false
+				}
+			}
+		case "to":
+			for _, v := range values {
+				if !containsAny(email.To, strings.ToLower(v)) {
+					return false
+				}
+			}
+		case "subject":
+			for _, v := range values {
+				if !strings.Contains(strings.ToLower(email.Subject), strings.ToLower(v)) {
+					return false
+				}
+			}
+		}
+	}
+	return true
+}
+
+func matchFlags(flags []string, with, without []string) bool {
+	has := make(map[string]bool, len(flags))
+	for _, f := range flags {
+		has[strings.ToLower(f)] = true
+	}
+	for _, f := range with {
+		if !has[strings.ToLower(string(f))] {
+			return false
+		}
+	}
+	for _, f := range without {
+		if has[strings.ToLower(string(f))] {
+			return false
+		}
+	}
+	return true
+}
+
+func matchDateRange(t time.Time, since, before time.Time) bool {
+	if !since.IsZero() && t.Before(since) {
+		return false
+	}
+	if !before.IsZero() && !t.Before(before) {
+		return false
+	}
+	return true
+}
+
+func matchSize(size int, larger, smaller uint32) bool {
+	if larger > 0 && uint32(size) <= larger {
+		return false
+	}
+	if smaller > 0 && uint32(size) >= smaller {
+		return false
+	}
+	return true
+}
+
+func containsAny(addrs []string, needle string) bool {
+	for _, a := range addrs {
+		if strings.Contains(strings.ToLower(a), needle) {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *IMAPMailbox) CreateMessage(flags []string, date time.Time, body imap.Literal) error {
@@ -377,14 +466,20 @@ func applyFlagsOp(current []string, op imap.FlagsOp, flags []string) []string {
 		flagSet[f] = true
 	}
 
-	for _, f := range flags {
-		switch op {
-		case imap.SetFlags:
-			flagSet = make(map[string]bool)
+	switch op {
+	case imap.SetFlags:
+		// Replace is a single atomic reset, not a per-flag mutation: doing it
+		// inside the loop would discard every flag except the last one.
+		flagSet = make(map[string]bool, len(flags))
+		for _, f := range flags {
 			flagSet[f] = true
-		case imap.AddFlags:
+		}
+	case imap.AddFlags:
+		for _, f := range flags {
 			flagSet[f] = true
-		case imap.RemoveFlags:
+		}
+	case imap.RemoveFlags:
+		for _, f := range flags {
 			delete(flagSet, f)
 		}
 	}
@@ -397,21 +492,27 @@ func applyFlagsOp(current []string, op imap.FlagsOp, flags []string) []string {
 }
 
 type Server struct {
-	srv *imapserver.Server
+	srv    *imapserver.Server
+	cancel context.CancelFunc
 }
 
-func NewServer(store mailstore.Store, authn *auth.Authenticator, addr string, tlsCfg *tls.Config) *Server {
-	backend := NewBackend(store, authn)
+// NewServer wires a mailstore.Store and auth.Authenticator into an IMAP server.
+// The context is propagated to every backend user so cancellation (shutdown,
+// timeout) reaches in-flight DB calls. When tlsCfg is nil, AllowInsecureAuth
+// is left false so no SASL PLAIN/LOGIN is accepted over plaintext.
+func NewServer(store mailstore.Store, authn *auth.Authenticator, addr string, tlsCfg *tls.Config, ctx context.Context) *Server {
+	sessionCtx, cancel := context.WithCancel(ctx)
+	backend := NewBackend(store, authn, sessionCtx)
 	srv := imapserver.New(backend)
 	srv.Addr = addr
-	srv.AllowInsecureAuth = true
+	srv.AllowInsecureAuth = tlsCfg == nil
 	srv.ErrorLog = log.Default()
 
 	if tlsCfg != nil {
 		srv.TLSConfig = tlsCfg
 	}
 
-	return &Server{srv: srv}
+	return &Server{srv: srv, cancel: cancel}
 }
 
 func (s *Server) Start() error {
@@ -424,5 +525,6 @@ func (s *Server) Start() error {
 }
 
 func (s *Server) Stop() {
+	s.cancel()
 	s.srv.Close()
 }
