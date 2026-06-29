@@ -21,8 +21,12 @@ type Email struct {
 	MailboxID int64     `json:"mailbox_id"`
 	From      string    `json:"from"`
 	To        []string  `json:"to"`
+	Cc        []string  `json:"cc"`
 	Subject   string    `json:"subject"`
 	Body      string    `json:"body"`
+	Raw       []byte    `json:"-"`
+	MessageID string    `json:"message_id"`
+	InReplyTo string    `json:"in_reply_to"`
 	Flags     []string  `json:"flags"`
 	Date      time.Time `json:"date"`
 	Size      int       `json:"size"`
