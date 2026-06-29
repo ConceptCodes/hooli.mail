@@ -56,11 +56,14 @@ func TestClassifyGroup(t *testing.T) {
 func TestBuildGroupsBucketsByDate(t *testing.T) {
 	m := newTestModel(t, &fakeSession{})
 	now := time.Now()
+	// Anchor to noon so that subtracting 1h never crosses a calendar day
+	// boundary (which would cause "Today" to shrink to 1 email near midnight).
+	noon := time.Date(now.Year(), now.Month(), now.Day(), 12, 0, 0, 0, now.Location())
 	m.emails = []mail.Summary{
-		{UID: 1, Date: now},
-		{UID: 2, Date: now.Add(-1 * time.Hour)},
-		{UID: 3, Date: now.AddDate(0, 0, -1)},
-		{UID: 4, Date: now.AddDate(0, 0, -20)},
+		{UID: 1, Date: noon},
+		{UID: 2, Date: noon.Add(-1 * time.Hour)},
+		{UID: 3, Date: noon.AddDate(0, 0, -1)},
+		{UID: 4, Date: noon.AddDate(0, 0, -20)},
 	}
 	groups := m.buildGroups()
 	if len(groups) != 3 {
